@@ -3,3 +3,5 @@ scipy
 ripser
 gudhi
 torch
+torchvision
+tqdm
