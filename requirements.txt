@@ -1,0 +1,17 @@
+numpy
+scipy
+scikit-learn
+matplotlib
+torch
+torchvision
+transformers
+datasets
+tokenizers
+Pillow
+timm
+medmnist
+ripser
+gudhi
+sacrebleu
+tqdm
+InquirerPy

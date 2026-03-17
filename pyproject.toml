@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tda-repr"
+version = "0.1.2"
+description = "Topological and spectral analysis of neural representations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = [
+  "topological data analysis",
+  "representation learning",
+  "deep learning",
+  "computer vision",
+  "natural language processing",
+  "persistent homology",
+  "hodge laplacian",
+  "neural network monitoring",
+]
+authors = [
+  { name = "Stepan Pankratov" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "torch",
+  "torchvision",
+  "tqdm",
+  "InquirerPy>=0.3.4",
+]
+
+[project.optional-dependencies]
+nlp = ["transformers", "datasets", "tokenizers", "sacrebleu"]
+topology = ["gudhi", "ripser"]
+medical = ["medmnist"]
+dev = ["pytest>=8", "build", "twine", "ruff>=0.6.0", "pre-commit>=3.8.0"]
+all = [
+  "transformers",
+  "datasets",
+  "tokenizers",
+  "sacrebleu",
+  "gudhi",
+  "ripser",
+  "medmnist",
+  "pytest>=8",
+  "build",
+  "twine",
+  "ruff>=0.6.0",
+  "pre-commit>=3.8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Octopupu5/tda_repr"
+
+[project.scripts]
+tda-repr-layers = "tda_repr.cli.layers:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["tda_repr*"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9"]

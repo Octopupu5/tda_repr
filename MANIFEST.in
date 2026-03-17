@@ -1,0 +1,11 @@
+prune runs
+prune data
+prune tests
+prune embeddings
+prune exps_for_anal
+prune results_figures_bundle
+prune assets
+prune .*
+prune __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
