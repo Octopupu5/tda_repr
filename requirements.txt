@@ -5,3 +5,9 @@ gudhi
 torch
 torchvision
 tqdm
+matplotlib
+Pillow
+transformers
+datasets
+tokenizers
+medmnist
