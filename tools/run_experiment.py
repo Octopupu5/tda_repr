@@ -250,6 +250,73 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 				step -= 1
 				continue
 			args.max_val_batches = int(v)
+			step += 1
+			continue
+
+		if step == 13:
+			bt = inquirer.select(
+				message="Build triangles (dim=2) for higher-order spectra?",
+				choices=["Yes", "No"] + _back_choice(step),
+				default=("Yes" if bool(args.build_triangles) else "No"),
+			).execute()
+			if bt == BACK:
+				step -= 1
+				continue
+			args.build_triangles = bool(bt == "Yes")
+			# Keep schedule options consistent.
+			if not bool(args.build_triangles):
+				args.dim2_every = 0
+			step += 1
+			continue
+
+		if step == 14:
+			# Scheduling knobs for triangle construction (only meaningful when enabled).
+			if not bool(args.build_triangles):
+				step += 1
+				continue
+			v = _ask_int("dim=2 every N epochs (0 = every epoch)", int(args.dim2_every), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.dim2_every = int(v)
+			step += 1
+			continue
+
+		if step == 15:
+			if not bool(args.build_triangles):
+				step += 1
+				continue
+			v = _ask_int("Max triangles per layer (safety cap)", int(args.max_triangles), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.max_triangles = int(v)
+			step += 1
+			continue
+
+		if step == 16:
+			q1 = inquirer.select(
+				message="Compute q=1 spectra (Δ₁) to analyze connectivity/cycles?",
+				choices=["Yes", "No"] + _back_choice(step),
+				default=("Yes" if bool(args.compute_q1_spectra) else "No"),
+			).execute()
+			if q1 == BACK:
+				step -= 1
+				continue
+			args.compute_q1_spectra = bool(q1 == "Yes")
+			if not bool(args.compute_q1_spectra):
+				args.q1_every = 0
+			step += 1
+			continue
+
+		if step == 17:
+			if not bool(args.compute_q1_spectra):
+				break
+			v = _ask_int("q=1 spectra every N epochs (0 = every epoch)", int(args.q1_every), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.q1_every = int(v)
 			break
 
 	return args
