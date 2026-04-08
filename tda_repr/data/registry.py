@@ -7,10 +7,14 @@ import torch
 import torchvision.datasets as tvd
 import torchvision.transforms as T
 import traceback
-from datasets import IterableDataset, load_dataset
 from medmnist import INFO
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+
+try:
+	from datasets import IterableDataset, load_dataset  # type: ignore
+except ModuleNotFoundError:
+	IterableDataset = None  # type: ignore
+	load_dataset = None  # type: ignore
 
 
 CollateFn = Callable[[list], dict]
@@ -148,12 +152,24 @@ def _get_medmnist(
 
 
 def _hf_text(path: str, split: str, config: Optional[str] = None):
+	if load_dataset is None:
+		raise ModuleNotFoundError(
+			"Optional dependency `datasets` is required for NLP datasets. "
+			"Install it with `pip install datasets` (or `pip install .[nlp]`)."
+		)
 	if config is None:
 		return load_dataset(path, split=split)
 	return load_dataset(path, config, split=split)
 
 
 def _build_text_collate(tokenizer_name: str = "distilbert-base-uncased", max_length: int = 128) -> CollateFn:
+	try:
+		from transformers import AutoTokenizer  # type: ignore
+	except ModuleNotFoundError as e:
+		raise ModuleNotFoundError(
+			"Optional dependency `transformers` is required for NLP tokenization. "
+			"Install it with `pip install transformers` (or `pip install .[nlp]`)."
+		) from e
 	tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 	def _collate(batch):
 		texts = [x["text"] if "text" in x else x.get("sentence", "") for x in batch]
@@ -308,7 +324,7 @@ def make_dataloaders(bundle: DataBundle, batch_size: int = 32, num_workers: int 
 			return None
 		# HF datasets (including streaming IterableDataset) yield dicts;
 		# DataLoader can handle them directly. For IterableDataset, disable shuffle.
-		if isinstance(ds, IterableDataset):
+		if IterableDataset is not None and isinstance(ds, IterableDataset):
 			shuffle_flag = False
 			# Convert output to torch.Tensor when supported.
 			if hasattr(ds, "with_format"):

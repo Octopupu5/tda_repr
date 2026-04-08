@@ -51,7 +51,76 @@ def _known_models_for_task(task: str) -> List[str]:
 	task = str(task).lower().strip()
 	if task == "cv":
 		return ["resnet18", "convnext_tiny", "efficientnet_b0", "mlp"]
-	return ["distilbert", "smollm"]
+	return ["distilbert", "smollm2-135m", "smollm2-360m"]
+
+
+def _require_transformers_runexp() -> object:
+	"""
+	Lazily import `transformers` for NLP experiments.
+	Kept local to avoid making CV-only runs depend on optional NLP deps.
+	"""
+	try:
+		import transformers  # type: ignore
+	except ModuleNotFoundError as e:
+		raise ModuleNotFoundError(
+			"Optional dependency `transformers` is required for task='nlp'. "
+			"Install it with `pip install transformers` (or `pip install .[nlp]`)."
+		) from e
+	return transformers
+
+
+def _pick_transformer_blocks_generic_for_model(model: nn.Module) -> List[str]:
+	"""
+	Best-effort taps for transformer models based on module names.
+	Works for DistilBERT-like models and many decoder-only LMs.
+	"""
+	all_named = set(dict(model.named_modules()).keys())
+
+	# Pick an embedding-like module if present.
+	out: List[str] = []
+	for emb_name in ("embeddings", "model.embed_tokens", "embed_tokens", "wte"):
+		if emb_name in all_named:
+			out.append(emb_name)
+			break
+
+	# Prefer the prefix that yields the most numeric block indices.
+	prefixes = [
+		"distilbert.transformer.layer",
+		"transformer.layer",
+		"model.layers",
+		"encoder.layer",
+		"layers",
+	]
+	best_prefix = ""
+	best_ids: List[int] = []
+	for p in prefixes:
+		ids: List[int] = []
+		for name in all_named:
+			if not name.startswith(p + "."):
+				continue
+			rest = name[len(p) + 1 :]
+			head = rest.split(".", 1)[0]
+			if head.isdigit():
+				ids.append(int(head))
+		ids = sorted(set(ids))
+		if len(ids) > len(best_ids):
+			best_ids = ids
+			best_prefix = p
+
+	if best_prefix and best_ids:
+		n = len(best_ids)
+		picks = sorted({best_ids[0], best_ids[n // 3], best_ids[(2 * n) // 3], best_ids[-1]})
+		out.extend([f"{best_prefix}.{i}" for i in picks])
+
+	# Keep only existing module paths and preserve order.
+	existing = set(dict(model.named_modules()).keys())
+	out2: List[str] = []
+	seen = set()
+	for n in out:
+		if n in existing and n not in seen:
+			out2.append(n)
+			seen.add(n)
+	return out2
 
 
 def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
@@ -160,7 +229,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			continue
 
 		if step == 4:
-			ft_choices = ["full", "linear_probe", "last_n_params", "named_prefixes", "named_patterns", "selected_layers"] + _back_choice(step)
+			ft_choices = ["full", "linear_probe", "last_n_params", "named_prefixes", "named_patterns", "selected_layers", "tracked_layers"] + _back_choice(step)
 			ft = inquirer.select(
 				message="Fine-tune strategy:",
 				choices=ft_choices,
@@ -177,7 +246,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			pre = inquirer.select(
 				message="Use pretrained backbone?",
 				choices=["Yes", "No"] + _back_choice(step),
-				default=("Yes" if bool(args.pretrained) else "No"),
+				default=("Yes" if (str(args.task).lower().strip() == "nlp" or bool(args.pretrained)) else "No"),
 			).execute()
 			if pre == BACK:
 				step -= 1
@@ -254,6 +323,55 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			continue
 
 		if step == 13:
+			# Optional NLP subsampling knobs (kept simple; shuffle+take-N in code).
+			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			v = _ask_int("NLP: max train examples (0 = no subsample)", int(getattr(args, "nlp_max_train_examples", 0)), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.nlp_max_train_examples = int(v)
+			step += 1
+			continue
+
+		if step == 14:
+			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			v = _ask_int("NLP: max val examples (0 = no subsample)", int(getattr(args, "nlp_max_val_examples", 0)), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.nlp_max_val_examples = int(v)
+			step += 1
+			continue
+
+		if step == 15:
+			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			v = _ask_int("NLP: max test examples (0 = no subsample)", int(getattr(args, "nlp_max_test_examples", 0)), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.nlp_max_test_examples = int(v)
+			step += 1
+			continue
+
+		if step == 16:
+			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			v = _ask_int("NLP: subsample seed", int(getattr(args, "nlp_subset_seed", 0)), step)
+			if v == BACK:
+				step -= 1
+				continue
+			args.nlp_subset_seed = int(v)
+			step += 1
+			continue
+
+		if step == 17:
 			bt = inquirer.select(
 				message="Build triangles (dim=2) for higher-order spectra?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -269,7 +387,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 14:
+		if step == 18:
 			# Scheduling knobs for triangle construction (only meaningful when enabled).
 			if not bool(args.build_triangles):
 				step += 1
@@ -282,7 +400,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 15:
+		if step == 19:
 			if not bool(args.build_triangles):
 				step += 1
 				continue
@@ -294,7 +412,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 16:
+		if step == 20:
 			q1 = inquirer.select(
 				message="Compute q=1 spectra (Δ₁) to analyze connectivity/cycles?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -309,7 +427,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 17:
+		if step == 21:
 			if not bool(args.compute_q1_spectra):
 				break
 			v = _ask_int("q=1 spectra every N epochs (0 = every epoch)", int(args.q1_every), step)
@@ -784,6 +902,29 @@ def _set_seed(seed: int) -> None:
 	np.random.seed(seed)
 
 
+def _maybe_subsample_hf_dataset(ds: Any, max_examples: int, seed: int) -> Any:
+	"""
+	Subsample HuggingFace Dataset (map-style) by shuffling then taking first N.
+	No-op for non-HF datasets or when max_examples <= 0.
+	"""
+	try:
+		n = int(max_examples)
+	except Exception:
+		n = 0
+	if n <= 0 or ds is None:
+		return ds
+	if not hasattr(ds, "select"):
+		return ds
+	try:
+		if hasattr(ds, "shuffle"):
+			ds = ds.shuffle(seed=int(seed))
+		# select first N
+		n_eff = min(int(n), int(len(ds)))
+		return ds.select(range(n_eff))
+	except Exception:
+		return ds
+
+
 def _infer_num_classes(ds: Any) -> int:
 	# torchvision style
 	if hasattr(ds, "classes") and isinstance(ds.classes, (list, tuple)) and len(ds.classes) > 0:
@@ -900,11 +1041,12 @@ def _build_cv_model(
 
 
 def _build_text_model(kind: str, num_classes: int, device: torch.device, pretrained: bool):
-	from transformers import (
-		AutoModelForSequenceClassification,
-		DistilBertConfig,
-		DistilBertForSequenceClassification,
-	)
+	tf = _require_transformers_runexp()
+	AutoModel = getattr(tf, "AutoModel")
+	AutoConfig = getattr(tf, "AutoConfig")
+	AutoModelForSequenceClassification = getattr(tf, "AutoModelForSequenceClassification")
+	DistilBertConfig = getattr(tf, "DistilBertConfig")
+	DistilBertForSequenceClassification = getattr(tf, "DistilBertForSequenceClassification")
 
 	k = kind.lower()
 	if k in ("distilbert", "distilbert-base-uncased"):
@@ -912,21 +1054,76 @@ def _build_text_model(kind: str, num_classes: int, device: torch.device, pretrai
 			model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=num_classes)
 		else:
 			model = DistilBertForSequenceClassification(DistilBertConfig(num_labels=num_classes))
-		layer_names = ["distilbert.transformer.layer.0", "distilbert.transformer.layer.2", "distilbert.transformer.layer.4"]
+		layer_names = _pick_transformer_blocks_generic_for_model(model)
 		model.to(device)
 		return model, layer_names
 
-	if k in ("smollm", "smollm2", "smollm-135m"):
-		# For classification, we attach a lightweight head on top of a base model.
+	SMOLLM_IDS = {
+		"smollm2-135m": "HuggingFaceTB/SmolLM2-135M",
+		"smollm2-360m": "HuggingFaceTB/SmolLM2-360M",
+		# Backward-compatible aliases
+		"smollm": "HuggingFaceTB/SmolLM2-135M",
+		"smollm2": "HuggingFaceTB/SmolLM2-135M",
+		"smollm-135m": "HuggingFaceTB/SmolLM2-135M",
+		"smollm-360m": "HuggingFaceTB/SmolLM2-360M",
+	}
+
+	if k in SMOLLM_IDS:
+		model_id = SMOLLM_IDS[k]
+		# Prefer a pretrained transformer backbone, then adapt to classification.
 		if pretrained:
-			base = AutoModelForSequenceClassification.from_pretrained("HuggingFaceTB/SmolLM2-135M", num_labels=num_classes)
-			model = base
+			# Try direct seq-classification head (may be unsupported for some model cards).
+			try:
+				model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=num_classes)
+				layer_names = _pick_transformer_blocks_generic_for_model(model)
+				model.to(device)
+				return model, layer_names
+			except Exception:
+				# Fall back to a base model + lightweight classification head.
+				cfg = AutoConfig.from_pretrained(model_id)
+				base = AutoModel.from_pretrained(model_id, config=cfg)
+
+				class _WrappedLMForSequenceClassification(nn.Module):
+					def __init__(self, base_model: nn.Module, n_labels: int):
+						super().__init__()
+						self.base = base_model
+						hid = getattr(getattr(base_model, "config", None), "hidden_size", None)
+						if hid is None:
+							hid = getattr(getattr(base_model, "config", None), "n_embd", None)
+						if hid is None:
+							raise ValueError("Could not infer hidden size for classification head.")
+						self.classifier = nn.Linear(int(hid), int(n_labels))
+
+					def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+						out = self.base(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+						# Prefer last_hidden_state; fall back to tuple[0]
+						h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+						# Pool: first token if available, else mean pool with mask.
+						if h.dim() == 3:
+							if attention_mask is not None and attention_mask.dim() == 2:
+								m = attention_mask.unsqueeze(-1).float()
+								hp = (h * m).sum(dim=1) / (m.sum(dim=1).clamp_min(1.0))
+							else:
+								hp = h[:, 0, :]
+						else:
+							hp = h
+						logits = self.classifier(hp)
+						loss = None
+						if labels is not None:
+							loss = nn.CrossEntropyLoss()(logits, labels)
+						# Mimic HF output object minimally.
+						return type("Out", (), {"logits": logits, "loss": loss})()
+
+				model = _WrappedLMForSequenceClassification(base, num_classes)
+				layer_names = [f"base.{n}" for n in _pick_transformer_blocks_generic_for_model(base)]
+				model.to(device)
+				return model, layer_names
 		else:
-			# fallback to DistilBERT-sized classifier head
+			# Offline fallback: use a small distilbert-sized classifier.
 			model = DistilBertForSequenceClassification(DistilBertConfig(num_labels=num_classes))
-		layer_names = ["distilbert.transformer.layer.0", "distilbert.transformer.layer.2", "distilbert.transformer.layer.4"]
-		model.to(device)
-		return model, layer_names
+			layer_names = _pick_transformer_blocks_generic_for_model(model)
+			model.to(device)
+			return model, layer_names
 
 	raise ValueError(f"Unknown text model kind: {kind}")
 
@@ -1041,9 +1238,19 @@ def main():
 	ap.add_argument("--pretrained", action="store_true")
 	ap.add_argument("--max_train_batches", type=int, default=0, help="0 = no limit")
 	ap.add_argument("--max_val_batches", type=int, default=0, help="0 = no limit")
+	# NLP subsampling (HF datasets)
+	ap.add_argument("--nlp_max_train_examples", type=int, default=0, help="If >0, subsample first N train examples for NLP datasets.")
+	ap.add_argument("--nlp_max_val_examples", type=int, default=0, help="If >0, subsample first N val examples for NLP datasets.")
+	ap.add_argument("--nlp_max_test_examples", type=int, default=0, help="If >0, subsample first N test examples for NLP datasets.")
+	ap.add_argument("--nlp_subset_seed", type=int, default=0, help="Seed used when subsampling NLP datasets (shuffle before selecting).")
 
 	# fine-tune strategies
-	ap.add_argument("--finetune", type=str, choices=["full", "linear_probe", "last_n_params", "named_prefixes", "named_patterns", "selected_layers"], default="full")
+	ap.add_argument(
+		"--finetune",
+		type=str,
+		choices=["full", "linear_probe", "last_n_params", "named_prefixes", "named_patterns", "selected_layers", "tracked_layers"],
+		default="full",
+	)
 	ap.add_argument(
 		"--sweep_finetune",
 		type=str,
@@ -1175,6 +1382,11 @@ def main():
 		device = torch.device(args.device)
 
 		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name="distilbert-base-uncased")
+		# Optional NLP dataset subsampling (useful for large HF datasets like yahoo_answers_topics).
+		if str(args.task).lower().strip() == "nlp":
+			bundle.train = _maybe_subsample_hf_dataset(bundle.train, int(args.nlp_max_train_examples), int(args.nlp_subset_seed))
+			bundle.val = _maybe_subsample_hf_dataset(bundle.val, int(args.nlp_max_val_examples), int(args.nlp_subset_seed))
+			bundle.test = _maybe_subsample_hf_dataset(bundle.test, int(args.nlp_max_test_examples), int(args.nlp_subset_seed))
 		loaders = make_dataloaders(bundle, batch_size=args.batch_size, num_workers=0)
 		train_loader = loaders["train"]
 		val_loader = loaders["val"] or loaders["test"]
@@ -1545,7 +1757,9 @@ def main():
 			if not selected_layers:
 				# Fallback to monitor layers if user didn't specify explicit trainable layers.
 				selected_layers = [x for x in layer_names if x in set(all_modules)]
-			include = [f"{m}.*" for m in selected_layers]
+			# Always keep classifier/head trainable when present.
+			head_prefixes = ("classifier", "score", "head", "fc")
+			include = [f"{m}.*" for m in selected_layers] + [f"{pfx}.*" for pfx in head_prefixes]
 			rep = set_trainable_by_name_selection(
 				model,
 				include=include,
@@ -1556,6 +1770,23 @@ def main():
 			if rep.unmatched:
 				print("[Trainable selection] unmatched module patterns:", rep.unmatched)
 			print(f"[Trainable selection] selected_layers={selected_layers}")
+		elif finetune_mode == "tracked_layers":
+			# Train only parameters under currently tracked monitor layers (+ always keep classifier/head trainable).
+			selected_layers = [x for x in layer_names if x in set(all_modules)]
+			if not selected_layers and args.strict_validation:
+				raise SelectionValidationError("No tracked layers available to fine-tune (monitor layer list is empty).")
+			head_prefixes = ("classifier", "score", "head", "fc")
+			include = [f"{m}.*" for m in selected_layers] + [f"{pfx}.*" for pfx in head_prefixes]
+			rep = set_trainable_by_name_selection(
+				model,
+				include=include,
+				exclude=[],
+				use_regex=False,
+				strict=bool(args.strict_validation),
+			)
+			if rep.unmatched:
+				print("[Trainable selection] unmatched module patterns:", rep.unmatched)
+			print(f"[Trainable selection] tracked_layers={selected_layers}")
 		else:
 			raise ValueError(f"Unknown finetune mode: {finetune_mode}")
 
