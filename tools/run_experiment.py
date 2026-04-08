@@ -54,6 +54,15 @@ def _known_models_for_task(task: str) -> List[str]:
 	return ["distilbert", "smollm2-135m", "smollm2-360m"]
 
 
+def _nlp_tokenizer_name(model_kind: str) -> str:
+	k = str(model_kind).lower().strip()
+	if k in ("smollm2-360m", "smollm-360m"):
+		return "HuggingFaceTB/SmolLM2-360M"
+	if k in ("smollm2-135m", "smollm2", "smollm", "smollm-135m"):
+		return "HuggingFaceTB/SmolLM2-135M"
+	return "distilbert-base-uncased"
+
+
 def _require_transformers_runexp() -> object:
 	"""
 	Lazily import `transformers` for NLP experiments.
@@ -945,10 +954,17 @@ def _infer_num_classes(ds: Any) -> int:
 		except Exception:
 			pass
 	# HF datasets style
-	if hasattr(ds, "features") and isinstance(ds.features, dict) and "label" in ds.features:
-		f = ds.features["label"]
-		if hasattr(f, "num_classes"):
-			return int(f.num_classes)
+	if hasattr(ds, "features") and isinstance(ds.features, dict):
+		keys = list(ds.features.keys())
+		preferred = ["label", "labels", "coarse_label", "fine_label", "target"]
+		candidates = [k for k in preferred if k in keys] + [k for k in keys if "label" in str(k).lower()]
+		for k in candidates:
+			f = ds.features.get(k, None)
+			if f is not None and hasattr(f, "num_classes"):
+				try:
+					return int(getattr(f, "num_classes"))
+				except Exception:
+					continue
 	# Fallback: assume 2-class if unknown
 	return 2
 
@@ -1381,7 +1397,8 @@ def main():
 		_set_seed(args.seed)
 		device = torch.device(args.device)
 
-		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name="distilbert-base-uncased")
+		tok_name = _nlp_tokenizer_name(str(args.model)) if str(args.task).lower().strip() == "nlp" else "distilbert-base-uncased"
+		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name=tok_name)
 		# Optional NLP dataset subsampling (useful for large HF datasets like yahoo_answers_topics).
 		if str(args.task).lower().strip() == "nlp":
 			bundle.train = _maybe_subsample_hf_dataset(bundle.train, int(args.nlp_max_train_examples), int(args.nlp_subset_seed))

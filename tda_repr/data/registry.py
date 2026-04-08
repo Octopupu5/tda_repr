@@ -171,9 +171,66 @@ def _build_text_collate(tokenizer_name: str = "distilbert-base-uncased", max_len
 			"Install it with `pip install transformers` (or `pip install .[nlp]`)."
 		) from e
 	tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+	text_key: Optional[str] = None
+	label_key: Optional[str] = None
+	label_map: dict[str, int] = {}
+
+	def _pick_key(example: dict, preferred: list[str], contains: str) -> Optional[str]:
+		for k in preferred:
+			if k in example:
+				return k
+		for k in example.keys():
+			if contains in str(k).lower():
+				return str(k)
+		return None
+
 	def _collate(batch):
-		texts = [x["text"] if "text" in x else x.get("sentence", "") for x in batch]
-		labels = [x.get("label", -1) for x in batch]
+		nonlocal text_key, label_key, label_map
+		if not batch:
+			raise ValueError("Empty batch for text collate.")
+		ex0 = batch[0]
+		if not isinstance(ex0, dict):
+			raise ValueError("Expected HF text dataset items to be dicts.")
+
+		if text_key is None:
+			text_key = _pick_key(ex0, ["text", "sentence", "question", "content", "review"], contains="text")
+		if label_key is None:
+			label_key = _pick_key(ex0, ["label", "labels", "coarse_label", "fine_label", "target"], contains="label")
+
+		if text_key is None:
+			raise ValueError(f"Could not infer text field from keys={list(ex0.keys())}")
+		if label_key is None:
+			raise ValueError(f"Could not infer label field from keys={list(ex0.keys())}")
+
+		texts = [str(x.get(text_key, "")) for x in batch]
+		labels_raw = [x.get(label_key, None) for x in batch]
+		labels: list[int] = []
+		for v in labels_raw:
+			if v is None:
+				raise ValueError(f"Missing label key '{label_key}' in batch item.")
+			if hasattr(v, "item"):
+				try:
+					v = v.item()
+				except Exception:
+					pass
+			if isinstance(v, bool):
+				labels.append(int(v))
+			elif isinstance(v, int):
+				labels.append(int(v))
+			elif isinstance(v, str):
+				if v not in label_map:
+					label_map[v] = len(label_map)
+				labels.append(int(label_map[v]))
+			else:
+				# Try best-effort int conversion (e.g. numpy scalar)
+				try:
+					labels.append(int(v))
+				except Exception as e:
+					raise ValueError(f"Unsupported label type: {type(v)} value={v}") from e
+
+		# Guard against the common failure mode: missing label field -> -1 labels.
+		if any(l < 0 for l in labels):
+			raise ValueError(f"Found negative labels (min={min(labels)}) for label_key='{label_key}'.")
 		tok_out = tok(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
 		tok_out["labels"] = torch.tensor(labels, dtype=torch.long)
 		return tok_out
