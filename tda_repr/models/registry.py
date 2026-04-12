@@ -189,11 +189,23 @@ def _pick_transformer_blocks_generic(model: nn.Module) -> List[str]:
 			break
 
 	if best_prefix and best_ids:
-		# pick a few layers spread across depth
+		# pick several layers spread across depth (bounded)
 		n = len(best_ids)
-		picks = sorted({best_ids[0], best_ids[n // 3], best_ids[(2 * n) // 3], best_ids[-1]})
+		k = int(min(12, n))
+		if k <= 1:
+			picks = [best_ids[0]]
+		else:
+			picks = []
+			for qi in range(k):
+				j = int(round(qi * (n - 1) / (k - 1)))
+				picks.append(best_ids[j])
+			picks = sorted(set(picks))
 		for i in picks:
 			out.append(f"{best_prefix}.{i}")
+	# common norms/heads (if present)
+	for head_name in ("model.norm", "norm", "ln_f", "lm_head", "score", "head", "classifier"):
+		if head_name in all_named:
+			out.append(head_name)
 	return _filter_existing(model, out)
 
 

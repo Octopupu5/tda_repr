@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -54,6 +55,15 @@ def _known_models_for_task(task: str) -> List[str]:
 	return ["distilbert", "smollm2-135m", "smollm2-360m"]
 
 
+def _default_device_string() -> str:
+	# Prefer CUDA, then Apple MPS, then CPU.
+	if torch.cuda.is_available():
+		return "cuda:0"
+	if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+		return "mps"
+	return "cpu"
+
+
 def _nlp_tokenizer_name(model_kind: str) -> str:
 	k = str(model_kind).lower().strip()
 	if k in ("smollm2-360m", "smollm-360m"):
@@ -87,7 +97,7 @@ def _pick_transformer_blocks_generic_for_model(model: nn.Module) -> List[str]:
 
 	# Pick an embedding-like module if present.
 	out: List[str] = []
-	for emb_name in ("embeddings", "model.embed_tokens", "embed_tokens", "wte"):
+	for emb_name in ("distilbert.embeddings", "embeddings", "model.embed_tokens", "embed_tokens", "wte"):
 		if emb_name in all_named:
 			out.append(emb_name)
 			break
@@ -117,9 +127,35 @@ def _pick_transformer_blocks_generic_for_model(model: nn.Module) -> List[str]:
 			best_prefix = p
 
 	if best_prefix and best_ids:
-		n = len(best_ids)
-		picks = sorted({best_ids[0], best_ids[n // 3], best_ids[(2 * n) // 3], best_ids[-1]})
-		out.extend([f"{best_prefix}.{i}" for i in picks])
+		# DistilBERT: track more than just a few blocks by default.
+		# This improves layer-wise monitoring without requiring manual selection in TUI.
+		if best_prefix.startswith("distilbert.transformer.layer") and len(best_ids) <= 24:
+			# all transformer blocks
+			out.extend([f"{best_prefix}.{i}" for i in best_ids])
+			# FFN modules per block (stable tensor outputs)
+			out.extend([f"{best_prefix}.{i}.ffn" for i in best_ids])
+		else:
+			# generic transformers: pick several layers spread across depth (smollm etc.)
+			n = len(best_ids)
+			k = int(min(12, n))  # cap to keep monitoring overhead bounded
+			if k <= 1:
+				picks = [best_ids[0]]
+			else:
+				picks = []
+				for qi in range(k):
+					j = int(round(qi * (n - 1) / (k - 1)))
+					picks.append(best_ids[j])
+				picks = sorted(set(picks))
+			out.extend([f"{best_prefix}.{i}" for i in picks])
+
+	# DistilBERT seq-classification head (when present)
+	for head_name in ("pre_classifier", "classifier"):
+		if head_name in all_named:
+			out.append(head_name)
+	# Common decoder-only / generic heads (if present)
+	for head_name in ("model.norm", "norm", "ln_f", "lm_head", "score", "head", "classifier"):
+		if head_name in all_named:
+			out.append(head_name)
 
 	# Keep only existing module paths and preserve order.
 	existing = set(dict(model.named_modules()).keys())
@@ -174,6 +210,14 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 				default=str(args.task),
 			).execute()
 			args.task = str(task)
+			# Task-specific sensible defaults.
+			# CV defaults (lr=1e-3) are too aggressive for transformer fine-tuning.
+			if str(args.task).lower().strip() == "nlp":
+				# Common stable defaults for DistilBERT-like fine-tuning.
+				args.lr = 2e-5
+				args.weight_decay = 1e-2
+				# Keep memory-friendly but not too small.
+				args.batch_size = 32
 			step += 1
 			continue
 
@@ -217,12 +261,38 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 3:
-			device_choices = ["cuda:0", "cpu", CUSTOM] + _back_choice(step)
+		if step == 3 and str(args.task).lower().strip() != "nlp":
+			# NLP has an extra step (objective selection) inserted at step==3.
+			# For CV we just advance to the shared next step.
+			step += 1
+			continue
+
+		if step == 3 and str(args.task).lower().strip() == "nlp":
+			obj_choices = ["classification", "generation"] + _back_choice(step)
+			obj = inquirer.select(
+				message="NLP objective:",
+				choices=obj_choices,
+				default=(str(args.nlp_objective) if str(args.nlp_objective) in obj_choices else "classification"),
+			).execute()
+			if obj == BACK:
+				step -= 1
+				continue
+			args.nlp_objective = str(obj)
+			# Sensible default benchmark metrics per objective.
+			if str(args.nlp_objective) == "generation":
+				args.bench_metrics = "loss,bleu"
+			step += 1
+			continue
+
+		if step == 4:
+			device_choices = ["cuda:0", "cpu"]
+			if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+				device_choices.insert(1, "mps")
+			device_choices = device_choices + [CUSTOM] + _back_choice(step)
 			d = inquirer.select(
 				message="Device:",
 				choices=device_choices,
-				default=(args.device if args.device in device_choices else ("cuda:0" if torch.cuda.is_available() else "cpu")),
+				default=(args.device if args.device in device_choices else _default_device_string()),
 			).execute()
 			if d == BACK:
 				step -= 1
@@ -237,7 +307,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 4:
+		if step == 5:
 			ft_choices = ["full", "linear_probe", "last_n_params", "named_prefixes", "named_patterns", "selected_layers", "tracked_layers"] + _back_choice(step)
 			ft = inquirer.select(
 				message="Fine-tune strategy:",
@@ -251,7 +321,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 5:
+		if step == 6:
 			pre = inquirer.select(
 				message="Use pretrained backbone?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -264,7 +334,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 6:
+		if step == 7:
 			dl = inquirer.select(
 				message="Allow dataset download?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -277,7 +347,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 7:
+		if step == 8:
 			v = _ask_int("Epochs", int(args.epochs), step)
 			if v == BACK:
 				step -= 1
@@ -286,7 +356,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 8:
+		if step == 9:
 			v = _ask_int("Batch size", int(args.batch_size), step)
 			if v == BACK:
 				step -= 1
@@ -295,7 +365,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 9:
+		if step == 10:
 			v = _ask_float("Learning rate", float(args.lr), step)
 			if v == BACK:
 				step -= 1
@@ -304,7 +374,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 10:
+		if step == 11:
 			v = _ask_float("Weight decay", float(args.weight_decay), step)
 			if v == BACK:
 				step -= 1
@@ -313,7 +383,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 11:
+		if step == 12:
 			v = _ask_int("Max train batches (0=no limit)", int(args.max_train_batches), step)
 			if v == BACK:
 				step -= 1
@@ -322,7 +392,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 12:
+		if step == 13:
 			v = _ask_int("Max val batches (0=no limit)", int(args.max_val_batches), step)
 			if v == BACK:
 				step -= 1
@@ -331,7 +401,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 13:
+		if step == 14:
 			# Optional NLP subsampling knobs (kept simple; shuffle+take-N in code).
 			if str(args.task).lower().strip() != "nlp":
 				step += 1
@@ -344,7 +414,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 14:
+		if step == 15:
 			if str(args.task).lower().strip() != "nlp":
 				step += 1
 				continue
@@ -356,7 +426,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 15:
+		if step == 16:
 			if str(args.task).lower().strip() != "nlp":
 				step += 1
 				continue
@@ -368,7 +438,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 16:
+		if step == 17:
 			if str(args.task).lower().strip() != "nlp":
 				step += 1
 				continue
@@ -380,7 +450,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 17:
+		if step == 18:
 			bt = inquirer.select(
 				message="Build triangles (dim=2) for higher-order spectra?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -396,7 +466,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 18:
+		if step == 19:
 			# Scheduling knobs for triangle construction (only meaningful when enabled).
 			if not bool(args.build_triangles):
 				step += 1
@@ -409,7 +479,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 19:
+		if step == 20:
 			if not bool(args.build_triangles):
 				step += 1
 				continue
@@ -421,7 +491,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 20:
+		if step == 21:
 			q1 = inquirer.select(
 				message="Compute q=1 spectra (Δ₁) to analyze connectivity/cycles?",
 				choices=["Yes", "No"] + _back_choice(step),
@@ -436,7 +506,7 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			step += 1
 			continue
 
-		if step == 21:
+		if step == 22:
 			if not bool(args.compute_q1_spectra):
 				break
 			v = _ask_int("q=1 spectra every N epochs (0 = every epoch)", int(args.q1_every), step)
@@ -857,7 +927,7 @@ def _interactive_pick_layers(current_layers: List[str], all_modules: List[str], 
 
 
 def _interactive_pick_bench_metrics(current: Tuple[str, ...]) -> Tuple[str, ...]:
-	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro"]
+	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
 	print("\n[Interactive] Available benchmark metrics:")
 	for i, m in enumerate(available):
 		flag = "*" if m in set(current) else " "
@@ -892,7 +962,7 @@ def _interactive_pick_layers_tui(current_layers: List[str], all_modules: List[st
 
 
 def _interactive_pick_bench_metrics_tui(current: Tuple[str, ...]) -> Tuple[str, ...]:
-	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro"]
+	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
 	current_set = set(current)
 	choices = [Choice(value=m, name=m, enabled=(m in current_set)) for m in available]
 	selected = inquirer.checkbox(
@@ -954,17 +1024,75 @@ def _infer_num_classes(ds: Any) -> int:
 		except Exception:
 			pass
 	# HF datasets style
-	if hasattr(ds, "features") and isinstance(ds.features, dict):
-		keys = list(ds.features.keys())
-		preferred = ["label", "labels", "coarse_label", "fine_label", "target"]
+	feats = getattr(ds, "features", None)
+	if feats is not None and hasattr(feats, "keys"):
+		try:
+			keys = list(feats.keys())
+		except Exception:
+			keys = []
+		preferred = ["label", "labels", "coarse_label", "fine_label", "target", "topic", "category", "class"]
 		candidates = [k for k in preferred if k in keys] + [k for k in keys if "label" in str(k).lower()]
+		# Some datasets use 'topic'/'category' instead of 'label'
+		candidates += [k for k in keys if any(s in str(k).lower() for s in ("topic", "category", "class"))]
+		# de-dup while preserving order
+		seen_c = set()
+		candidates = [k for k in candidates if not (k in seen_c or seen_c.add(k))]
 		for k in candidates:
-			f = ds.features.get(k, None)
+			try:
+				f = feats[k]  # datasets.Features supports __getitem__
+			except Exception:
+				try:
+					f = feats.get(k, None)  # type: ignore[union-attr]
+				except Exception:
+					f = None
 			if f is not None and hasattr(f, "num_classes"):
 				try:
 					return int(getattr(f, "num_classes"))
 				except Exception:
 					continue
+
+	# Last-resort: probe a prefix of labels
+	if hasattr(ds, "__len__") and hasattr(ds, "__getitem__"):
+		try:
+			n = int(len(ds))
+		except Exception:
+			n = 0
+		if n > 0:
+			try:
+				ex0 = ds[0]
+			except Exception:
+				ex0 = None
+			if isinstance(ex0, dict):
+				ex_keys = list(ex0.keys())
+				preferred = ["label", "labels", "coarse_label", "fine_label", "target", "topic", "category", "class"]
+				candidates = [k for k in preferred if k in ex_keys] + [k for k in ex_keys if "label" in str(k).lower()]
+				candidates += [k for k in ex_keys if any(s in str(k).lower() for s in ("topic", "category", "class"))]
+				seen_c = set()
+				candidates = [k for k in candidates if not (k in seen_c or seen_c.add(k))]
+				label_key = candidates[0] if candidates else None
+				if label_key is not None:
+					vals: list[int] = []
+					n_probe = min(512, n)
+					for i in range(n_probe):
+						try:
+							ex = ds[i]
+						except Exception:
+							continue
+						if not isinstance(ex, dict) or label_key not in ex:
+							continue
+						v = ex.get(label_key, None)
+						try:
+							vi = int(v)
+						except Exception:
+							continue
+						if vi >= 0:
+							vals.append(vi)
+					if vals:
+						vmin, vmax = int(min(vals)), int(max(vals))
+						# handle 1-based labels (common in some datasets)
+						if vmin == 1 and 0 not in set(vals):
+							return int(vmax)
+						return int(vmax) + 1
 	# Fallback: assume 2-class if unknown
 	return 2
 
@@ -991,7 +1119,8 @@ def _infer_cv_input_flat_dim(ds: Any) -> Optional[int]:
 
 
 def _is_text_batch(batch: Any) -> bool:
-	return isinstance(batch, dict) and ("input_ids" in batch or "attention_mask" in batch)
+	# HF tokenizer collate returns `BatchEncoding` (Mapping, not dict).
+	return isinstance(batch, Mapping) and ("input_ids" in batch or "attention_mask" in batch or "labels" in batch)
 
 
 def _cv_noise_transform(x: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -1230,7 +1359,7 @@ def main():
 	ap.add_argument("--model", type=str, default="resnet18")
 	ap.add_argument("--data_root", type=str, default="./data")
 	ap.add_argument("--download", action="store_true")
-	ap.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+	ap.add_argument("--device", type=str, default=_default_device_string())
 	ap.add_argument("--seed", type=int, default=0)
 	ap.add_argument(
 		"--interactive",
@@ -1252,6 +1381,32 @@ def main():
 	ap.add_argument("--lr", type=float, default=1e-3)
 	ap.add_argument("--weight_decay", type=float, default=1e-4)
 	ap.add_argument("--pretrained", action="store_true")
+	ap.add_argument(
+		"--nlp_scheduler",
+		type=str,
+		choices=["none", "linear"],
+		default="linear",
+		help="NLP LR scheduler. 'linear' = linear warmup then linear decay to 0.",
+	)
+	ap.add_argument(
+		"--nlp_warmup_ratio",
+		type=float,
+		default=0.1,
+		help="Warmup fraction of total train steps for NLP (used when --nlp_scheduler=linear).",
+	)
+	ap.add_argument(
+		"--nlp_warmup_steps",
+		type=int,
+		default=0,
+		help="If >0, overrides warmup steps (used when --nlp_scheduler=linear).",
+	)
+	ap.add_argument(
+		"--nlp_objective",
+		type=str,
+		choices=["classification", "generation"],
+		default="classification",
+		help="NLP objective: classification (default) or causal-LM generation (prompt->target).",
+	)
 	ap.add_argument("--max_train_batches", type=int, default=0, help="0 = no limit")
 	ap.add_argument("--max_val_batches", type=int, default=0, help="0 = no limit")
 	# NLP subsampling (HF datasets)
@@ -1398,12 +1553,97 @@ def main():
 		device = torch.device(args.device)
 
 		tok_name = _nlp_tokenizer_name(str(args.model)) if str(args.task).lower().strip() == "nlp" else "distilbert-base-uncased"
+		nlp_objective = str(getattr(args, "nlp_objective", "classification")).lower().strip()
+
+		nlp_tokenizer = None
+		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+			tf = _require_transformers_runexp()
+			AutoTokenizer = getattr(tf, "AutoTokenizer")
+			nlp_tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+			# Ensure padding token exists (Llama-like tokenizers often lack it).
+			try:
+				if getattr(nlp_tokenizer, "pad_token", None) is None:
+					eos = getattr(nlp_tokenizer, "eos_token", None)
+					if eos is not None:
+						nlp_tokenizer.pad_token = eos
+					else:
+						nlp_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+			except Exception:
+				pass
 		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name=tok_name)
 		# Optional NLP dataset subsampling (useful for large HF datasets like yahoo_answers_topics).
 		if str(args.task).lower().strip() == "nlp":
 			bundle.train = _maybe_subsample_hf_dataset(bundle.train, int(args.nlp_max_train_examples), int(args.nlp_subset_seed))
 			bundle.val = _maybe_subsample_hf_dataset(bundle.val, int(args.nlp_max_val_examples), int(args.nlp_subset_seed))
 			bundle.test = _maybe_subsample_hf_dataset(bundle.test, int(args.nlp_max_test_examples), int(args.nlp_subset_seed))
+
+		# Override collate for generation objective: prompt -> target, with token-level labels.
+		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+			if nlp_tokenizer is None:
+				raise RuntimeError("Internal error: tokenizer is required for generation objective.")
+			max_len = 128
+
+			def _qa_gen_collate(batch):
+				if not batch:
+					raise ValueError("Empty batch for generation collate.")
+				ex0 = batch[0]
+				if not isinstance(ex0, dict):
+					raise ValueError("Expected HF dataset items to be dicts.")
+
+				def _get_text(ex: dict, keys: list[str]) -> str:
+					parts = []
+					for k in keys:
+						v = ex.get(k, "")
+						s = str(v).strip()
+						if s:
+							parts.append(s)
+					return "\n\n".join(parts)
+
+				prompts = []
+				targets = []
+				for ex in batch:
+					if not isinstance(ex, dict):
+						continue
+					# Yahoo Answers Topics fields (preferred)
+					q = _get_text(ex, ["question_title", "question_content"])
+					a = _get_text(ex, ["best_answer"])
+					# Fallbacks for other datasets
+					if not q:
+						q = _get_text(ex, ["question", "prompt", "text"])
+					if not a:
+						a = _get_text(ex, ["answer", "target", "text"])
+					prompt = f"Question:\n{q}\n\nAnswer:\n"
+					prompts.append(prompt)
+					targets.append(a)
+
+				# For generation eval: prompt-only inputs + reference target labels
+				prompt_enc = nlp_tokenizer(prompts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+				ref_enc = nlp_tokenizer(targets, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+				ref_labels = ref_enc["input_ids"].clone()
+				if "attention_mask" in ref_enc:
+					ref_labels[ref_enc["attention_mask"] == 0] = -100
+
+				# For training loss: full sequence with prompt masked out in labels
+				eos = getattr(nlp_tokenizer, "eos_token", "") or ""
+				full_texts = [(p + t + eos) for p, t in zip(prompts, targets)]
+				full_enc = nlp_tokenizer(full_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+				labels = full_enc["input_ids"].clone()
+				if "attention_mask" in full_enc:
+					labels[full_enc["attention_mask"] == 0] = -100
+				prompt_lens = prompt_enc["attention_mask"].sum(dim=1).tolist() if "attention_mask" in prompt_enc else [0] * labels.shape[0]
+				for i, pl in enumerate(prompt_lens):
+					pl = int(pl)
+					if pl > 0:
+						labels[i, :pl] = -100
+
+				out = dict(full_enc)
+				out["labels"] = labels
+				out["gen_input_ids"] = prompt_enc.get("input_ids")
+				out["gen_attention_mask"] = prompt_enc.get("attention_mask")
+				out["gen_ref_labels"] = ref_labels
+				return out
+
+			bundle.collate_fn = _qa_gen_collate
 		loaders = make_dataloaders(bundle, batch_size=args.batch_size, num_workers=0)
 		train_loader = loaders["train"]
 		val_loader = loaders["val"] or loaders["test"]
@@ -1427,10 +1667,34 @@ def main():
 			)
 			loss_fn = nn.CrossEntropyLoss()
 		elif args.task == "nlp":
-			model, layer_names = _build_text_model(args.model, num_classes=num_classes, device=device, pretrained=args.pretrained)
-			loss_fn = nn.CrossEntropyLoss()
+			if nlp_objective == "generation":
+				tf = _require_transformers_runexp()
+				AutoConfig = getattr(tf, "AutoConfig")
+				AutoModelForCausalLM = getattr(tf, "AutoModelForCausalLM")
+				model_id = _nlp_tokenizer_name(str(args.model))
+				if bool(args.pretrained):
+					model = AutoModelForCausalLM.from_pretrained(model_id)
+				else:
+					cfg = AutoConfig.from_pretrained(model_id)
+					model = AutoModelForCausalLM.from_config(cfg)
+				model.to(device)
+				layer_names = _pick_transformer_blocks_generic_for_model(model)
+				loss_fn = None
+			else:
+				model, layer_names = _build_text_model(args.model, num_classes=num_classes, device=device, pretrained=args.pretrained)
+				loss_fn = nn.CrossEntropyLoss()
 		else:
 			raise ValueError("Unknown task")
+
+		# Helpful runtime provenance: confirm which model initialization path was used.
+		model_name_or_path = getattr(model, "name_or_path", None)
+		if not model_name_or_path:
+			model_name_or_path = getattr(getattr(model, "config", None), "_name_or_path", None)
+		print(
+			f"[Model] class={model.__class__.__name__} pretrained_flag={bool(args.pretrained)} "
+			f"nlp_objective={nlp_objective if str(args.task).lower().strip() == 'nlp' else ''} "
+			f"name_or_path={model_name_or_path!r}"
+		)
 
 		# Override layers if provided
 		all_modules = list_module_names(model, leaf_only=bool(args.list_layers_leaf_only))
@@ -1719,6 +1983,7 @@ def main():
 				"finetune": finetune_mode,
 				"device": str(device),
 				"num_classes": int(num_classes),
+				"model_name_or_path": model_name_or_path,
 				"monitor": asdict(monitor_cfg),
 				"args": vars(args),
 			}
@@ -1726,12 +1991,33 @@ def main():
 		checkpoints_dir = os.path.join(store.run_dir, "checkpoints")
 		best_ckpt_path = os.path.join(checkpoints_dir, "model_best_main.pt")
 		early_ckpt_path = os.path.join(checkpoints_dir, "model_early_signal.pt")
-		tracker = ExperimentTracker(
-			monitor=monitor,
-			benchmarks=[
+		bench_specs: List[BenchmarkSpec] = []
+		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+			bench_specs = [
+				BenchmarkSpec(
+					name=f"{args.dataset}-val",
+					dataloader_key="val",
+					kind="generation",
+					metrics=tuple(bench_metrics),
+					tokenizer=nlp_tokenizer,
+				),
+				BenchmarkSpec(
+					name=f"{args.dataset}-test",
+					dataloader_key="test",
+					kind="generation",
+					metrics=tuple(bench_metrics),
+					tokenizer=nlp_tokenizer,
+				),
+			]
+		else:
+			bench_specs = [
 				BenchmarkSpec(name=f"{args.dataset}-val", dataloader_key="val", metrics=tuple(bench_metrics)),
 				BenchmarkSpec(name=f"{args.dataset}-test", dataloader_key="test", metrics=tuple(bench_metrics)),
-			],
+			]
+
+		tracker = ExperimentTracker(
+			monitor=monitor,
+			benchmarks=bench_specs,
 			store=store,
 			cfg=TrackerConfig(run_dir=store.run_dir, eval_every=1, max_eval_batches=(args.max_val_batches or None)),
 		)
@@ -1811,6 +2097,38 @@ def main():
 		if not params:
 			raise ValueError(f"No trainable parameters for finetune mode '{finetune_mode}'.")
 		opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+		lr_sched = None
+		if str(args.task).lower().strip() == "nlp" and str(getattr(args, "nlp_scheduler", "none")).lower().strip() == "linear":
+			# Linear warmup then linear decay to 0 (common HF fine-tune recipe).
+			try:
+				epochs = int(args.epochs)
+				steps_per_epoch = None
+				try:
+					steps_per_epoch = int(len(train_loader))
+				except Exception:
+					steps_per_epoch = None
+				if args.max_train_batches and int(args.max_train_batches) > 0:
+					steps_per_epoch = (
+						int(min(int(args.max_train_batches), steps_per_epoch)) if steps_per_epoch is not None else int(args.max_train_batches)
+					)
+				if steps_per_epoch is None or steps_per_epoch <= 0:
+					steps_per_epoch = 1
+				total_steps = max(1, int(epochs) * int(steps_per_epoch))
+				warmup_steps = int(getattr(args, "nlp_warmup_steps", 0) or 0)
+				if warmup_steps <= 0:
+					warmup_steps = int(float(getattr(args, "nlp_warmup_ratio", 0.1)) * float(total_steps))
+				warmup_steps = max(0, min(int(warmup_steps), int(total_steps)))
+
+				def _lr_lambda(step: int) -> float:
+					if warmup_steps > 0 and step < warmup_steps:
+						return float(step) / float(max(1, warmup_steps))
+					den = float(max(1, total_steps - warmup_steps))
+					return max(0.0, float(total_steps - step) / den)
+
+				lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
+				print(f"[NLP] lr_scheduler=linear warmup_steps={warmup_steps} total_steps={total_steps}")
+			except Exception as e:
+				print("[NLP] Failed to set LR scheduler:", e)
 
 		reg_layer = args.reg_layer.strip() or (layer_names[0] if layer_names else "")
 		early_signal_logged = False
@@ -1863,10 +2181,37 @@ def main():
 						loss = loss_fn(logits, y)
 					elif _is_text_batch(batch):
 						batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
-						out = model(**batch)
-						logits = out.logits if hasattr(out, "logits") else out[0]
-						y = batch.get("labels", None)
-						loss = out.loss if hasattr(out, "loss") and out.loss is not None else loss_fn(logits, y)
+						if nlp_objective == "generation":
+							# CausalLM training: use token-level labels with prompt masked by -100.
+							fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
+							out = model(**fwd)
+							if hasattr(out, "loss") and out.loss is not None:
+								loss = out.loss
+							else:
+								raise ValueError("CausalLM forward did not return .loss; ensure batch contains token-level 'labels'.")
+						else:
+							y = batch.get("labels", None)
+							# Avoid letting HF models compute loss internally before we validate labels.
+							fwd = {k: v for k, v in batch.items() if k != "labels"}
+							out = model(**fwd)
+							logits = out.logits if hasattr(out, "logits") else out[0]
+							if y is None:
+								raise ValueError("Text batch is missing 'labels' field.")
+							try:
+								y_cpu = y.detach().to("cpu")
+								ymin = int(y_cpu.min().item())
+								ymax = int(y_cpu.max().item())
+								nc = int(logits.shape[-1])
+								if ymin < 0 or ymax >= nc:
+									raise ValueError(
+										f"Label values out of range for classification head: "
+										f"min={ymin}, max={ymax}, num_classes={nc}. "
+										f"(Hint: dataset label field may be wrong or needs remapping to 0..C-1.)"
+									)
+							except Exception:
+								# If anything goes wrong in validation, proceed; the loss will surface the error.
+								pass
+							loss = loss_fn(logits, y)
 					else:
 						continue
 
@@ -1879,7 +2224,18 @@ def main():
 							loss = loss + float(args.reg_weight) * pen
 
 					loss.backward()
+					# Transformers fine-tuning is often sensitive; clip to keep it stable.
+					if str(args.task).lower().strip() == "nlp":
+						try:
+							torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+						except Exception:
+							pass
 					opt.step()
+					if lr_sched is not None:
+						try:
+							lr_sched.step()
+						except Exception:
+							pass
 					monitor.collect("train")
 					train_it.set_postfix(loss=float(loss.detach().item()))
 			train_s = time.perf_counter() - t0
@@ -1911,7 +2267,11 @@ def main():
 						_ = model(x)
 					elif _is_text_batch(batch):
 						batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
-						_ = model(**batch)
+						if nlp_objective == "generation":
+							fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
+							_ = model(**fwd)
+						else:
+							_ = model(**batch)
 					monitor.collect("val")
 			val_s = time.perf_counter() - t0
 
@@ -1929,14 +2289,25 @@ def main():
 			mm = (bench.get(main_key, {}) or {})
 			acc = mm.get("accuracy", None)
 			f1 = mm.get("f1_macro", None)
+			bleu = mm.get("bleu", None)
 			los = mm.get("loss", None)
+			err = mm.get("error", None)
 			rep_s = float(((out.get("timing_s", {}) or {}).get("repr_end_epoch", 0.0) or 0.0))
 			bench_s = float(((out.get("timing_s", {}) or {}).get("bench_total", 0.0) or 0.0))
 			epoch_s = float(time.perf_counter() - t_epoch0)
-			print(
-				f"[Epoch {epoch}] val_loss={los} val_acc={acc} val_f1_macro={f1} "
-				f"train_s={train_s:.2f} val_s={val_s:.2f} repr_s={rep_s:.2f} bench_s={bench_s:.2f} epoch_s={epoch_s:.2f}"
-			)
+			err_str = f" val_error={err}" if err else ""
+			if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+				print(
+					f"[Epoch {epoch}] val_loss={los} val_bleu={bleu} "
+					f"train_s={train_s:.2f} val_s={val_s:.2f} repr_s={rep_s:.2f} bench_s={bench_s:.2f} epoch_s={epoch_s:.2f}"
+					f"{err_str}"
+				)
+			else:
+				print(
+					f"[Epoch {epoch}] val_loss={los} val_acc={acc} val_f1_macro={f1} "
+					f"train_s={train_s:.2f} val_s={val_s:.2f} repr_s={rep_s:.2f} bench_s={bench_s:.2f} epoch_s={epoch_s:.2f}"
+					f"{err_str}"
+				)
 
 			# Repr-based early-stop signal (no hard stop).
 			if bool(args.early_stop) and epoch >= int(args.early_stop_start_epoch):

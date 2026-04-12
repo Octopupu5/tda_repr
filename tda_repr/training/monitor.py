@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from collections.abc import Mapping
 import numpy as np
 import torch
 import time
@@ -92,6 +93,12 @@ def _first_tensor(x: Any) -> Optional["np.ndarray"]:
 	# tensor
 	if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
 		return x
+	# HF ModelOutput-like (e.g., BaseModelOutput) often provides .to_tuple()
+	if hasattr(x, "to_tuple") and callable(getattr(x, "to_tuple")):
+		try:
+			return _first_tensor(x.to_tuple())
+		except Exception:
+			pass
 	# tuple/list
 	if isinstance(x, (list, tuple)):
 		for it in x:
@@ -99,14 +106,26 @@ def _first_tensor(x: Any) -> Optional["np.ndarray"]:
 			if t is not None:
 				return t
 		return None
-	# dict-like
-	if isinstance(x, dict):
+	# mapping / dict-like (incl. HF ModelOutput which can behave like a mapping)
+	if isinstance(x, (dict, Mapping)) or (hasattr(x, "keys") and hasattr(x, "__getitem__")):
+		try:
+			keys = list(x.keys())  # type: ignore[attr-defined]
+		except Exception:
+			keys = []
 		for key in ("last_hidden_state", "hidden_states", "logits"):
-			if key in x:
-				t = _first_tensor(x[key])
+			if key in keys:
+				try:
+					v = x[key]  # type: ignore[index]
+				except Exception:
+					continue
+				t = _first_tensor(v)
 				if t is not None:
 					return t
-		for v in x.values():
+		try:
+			vals = list(x.values())  # type: ignore[attr-defined]
+		except Exception:
+			vals = []
+		for v in vals:
 			t = _first_tensor(v)
 			if t is not None:
 				return t

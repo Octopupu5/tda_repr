@@ -72,8 +72,10 @@ def evaluate_classification(
 					y = batch["label"]
 					batch["labels"] = y
 
-				# Run model (if labels present, HF models will compute loss)
-				out = model(**batch)
+				# Always run model without labels to avoid crashes on splits with unknown labels (-1)
+				# and keep evaluation loss computation consistent across HF/non-HF models.
+				fwd = {k: v for k, v in batch.items() if k not in ("labels", "label")}
+				out = model(**fwd)
 				# HF models often return objects with .logits/.loss
 				logits = out.logits if hasattr(out, "logits") else out[0]
 			else:
@@ -93,7 +95,9 @@ def evaluate_classification(
 					y = y.view(-1)
 				if y.dtype != torch.long:
 					y = y.long()
-				mask = (y >= 0)
+				# keep only valid labels (HF datasets sometimes use -1; also guard against
+				# accidental num_classes mismatch to avoid shape errors in cm building)
+				mask = (y >= 0) & (y < int(logits.shape[-1]))
 				y_eval = y[mask]
 				logits_eval = logits[mask]
 
@@ -117,10 +121,7 @@ def evaluate_classification(
 					cm += counts
 
 					# Loss: prefer model-provided loss if available, else compute from logits
-					if out is not None and hasattr(out, "loss") and out.loss is not None:
-						loss_sum += float(out.loss.item())
-						loss_n += 1
-					elif loss_fn is not None:
+					if loss_fn is not None:
 						l = loss_fn(logits_eval, y_eval)
 						loss_sum += float(l.item())
 						loss_n += 1
@@ -157,10 +158,10 @@ def evaluate_generation_bleu(
 	"""
 	Evaluate a generative model with corpus BLEU (sacrebleu).
 
-	Expected dataloader batches: mappings that include:
-	- input_ids: tokenized source/prompt
-	- attention_mask: optional
-	- labels: tokenized reference target (may contain -100 for ignored tokens)
+	Expected dataloader batches: mappings that include either:
+	- input_ids/attention_mask/labels (prompt + reference), OR
+	- gen_input_ids/gen_attention_mask/gen_ref_labels for generation,
+	  plus input_ids/attention_mask/labels for optional loss computation.
 	"""
 	if tokenizer is None:
 		raise ValueError("tokenizer is required for BLEU evaluation")
@@ -178,6 +179,9 @@ def evaluate_generation_bleu(
 	if pad_id is None:
 		pad_id = 0
 
+	loss_sum = 0.0
+	loss_n = 0
+
 	with torch.no_grad():
 		for bi, batch in enumerate(dataloader):
 			if max_batches is not None and bi >= max_batches:
@@ -186,9 +190,11 @@ def evaluate_generation_bleu(
 				raise TypeError("Expected batch to be a mapping with input_ids/labels")
 
 			batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
-			input_ids = batch.get("input_ids", None)
-			attention_mask = batch.get("attention_mask", None)
-			labels = batch.get("labels", None)
+
+			# Prefer prompt-only fields when provided by a collate_fn.
+			input_ids = batch.get("gen_input_ids", None) or batch.get("input_ids", None)
+			attention_mask = batch.get("gen_attention_mask", None) or batch.get("attention_mask", None)
+			labels = batch.get("gen_ref_labels", None) or batch.get("labels", None)
 			if labels is None and "label" in batch:
 				labels = batch["label"]
 
@@ -196,6 +202,17 @@ def evaluate_generation_bleu(
 				raise KeyError("Batch must include 'input_ids' and 'labels' (or legacy 'label').")
 			if not isinstance(input_ids, torch.Tensor) or not isinstance(labels, torch.Tensor):
 				raise TypeError("'input_ids' and 'labels' must be torch.Tensors")
+
+			# Optional loss on full input/labels (if present).
+			if ("input_ids" in batch) and ("labels" in batch):
+				try:
+					fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
+					out = model(**fwd)
+					if hasattr(out, "loss") and out.loss is not None:
+						loss_sum += float(out.loss.item())
+						loss_n += 1
+				except Exception:
+					pass
 
 			gen_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
 			if not isinstance(gen_ids, torch.Tensor):
@@ -215,4 +232,7 @@ def evaluate_generation_bleu(
 	if not hyp:
 		return {"bleu": 0.0}
 	bleu = sacrebleu.corpus_bleu(hyp, [ref])
-	return {"bleu": float(bleu.score)}
+	out = {"bleu": float(bleu.score)}
+	if loss_n > 0:
+		out["loss"] = loss_sum / loss_n
+	return out

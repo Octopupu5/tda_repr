@@ -171,7 +171,21 @@ def _build_text_collate(tokenizer_name: str = "distilbert-base-uncased", max_len
 			"Install it with `pip install transformers` (or `pip install .[nlp]`)."
 		) from e
 	tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+	# Many decoder-only tokenizers (Llama-like, incl. SmolLM) ship without a pad token.
+	# For classification-style batching we can safely pad with EOS.
+	try:
+		if getattr(tok, "pad_token", None) is None:
+			eos = getattr(tok, "eos_token", None)
+			if eos is not None:
+				tok.pad_token = eos
+			else:
+				# Last resort: add an explicit pad token.
+				tok.add_special_tokens({"pad_token": "[PAD]"})
+	except Exception:
+		# If anything goes wrong, let tokenizer call raise a clear error later.
+		pass
 	text_key: Optional[str] = None
+	text_keys_multi: Optional[tuple[str, ...]] = None
 	label_key: Optional[str] = None
 	label_map: dict[str, int] = {}
 
@@ -185,24 +199,79 @@ def _build_text_collate(tokenizer_name: str = "distilbert-base-uncased", max_len
 		return None
 
 	def _collate(batch):
-		nonlocal text_key, label_key, label_map
+		nonlocal text_key, text_keys_multi, label_key, label_map
 		if not batch:
 			raise ValueError("Empty batch for text collate.")
 		ex0 = batch[0]
 		if not isinstance(ex0, dict):
 			raise ValueError("Expected HF text dataset items to be dicts.")
 
-		if text_key is None:
-			text_key = _pick_key(ex0, ["text", "sentence", "question", "content", "review"], contains="text")
+		if text_key is None and text_keys_multi is None:
+			# Common single-field datasets
+			text_key = _pick_key(
+				ex0,
+				[
+					"text",
+					"sentence",
+					"question",
+					"content",
+					"review",
+					# Yahoo Answers Topics / similar
+					"question_content",
+					"question_title",
+					"best_answer",
+					"answer",
+					"title",
+				],
+				contains="text",
+			)
+			# Yahoo Answers Topics has multiple useful text fields; concatenate them (prefer this).
+			if all(k in ex0 for k in ("question_title", "question_content", "best_answer")):
+				text_keys_multi = ("question_title", "question_content", "best_answer")
+				text_key = None
+			elif all(k in ex0 for k in ("question_title", "question_content")):
+				text_keys_multi = ("question_title", "question_content")
+				text_key = None
+			elif ("question" in ex0) and ("answer" in ex0):
+				text_keys_multi = ("question", "answer")
+				text_key = None
+			# Fallback: try any key that contains these substrings.
+			if text_key is None and text_keys_multi is None:
+				for needle in ("question", "answer", "content", "title", "review"):
+					k = _pick_key(ex0, [], contains=needle)
+					if k is not None:
+						text_key = k
+						break
 		if label_key is None:
-			label_key = _pick_key(ex0, ["label", "labels", "coarse_label", "fine_label", "target"], contains="label")
+			label_key = _pick_key(
+				ex0,
+				["label", "labels", "coarse_label", "fine_label", "target", "topic", "category", "class"],
+				contains="label",
+			)
+			if label_key is None:
+				for needle in ("topic", "category", "class"):
+					k = _pick_key(ex0, [], contains=needle)
+					if k is not None:
+						label_key = k
+						break
 
-		if text_key is None:
+		if text_key is None and text_keys_multi is None:
 			raise ValueError(f"Could not infer text field from keys={list(ex0.keys())}")
 		if label_key is None:
 			raise ValueError(f"Could not infer label field from keys={list(ex0.keys())}")
 
-		texts = [str(x.get(text_key, "")) for x in batch]
+		def _join_text(ex: dict) -> str:
+			if text_keys_multi is not None:
+				parts: list[str] = []
+				for k in text_keys_multi:
+					v = ex.get(k, "")
+					s = str(v).strip()
+					if s:
+						parts.append(s)
+				return "\n\n".join(parts)
+			return str(ex.get(text_key or "", ""))
+
+		texts = [_join_text(x) for x in batch]
 		labels_raw = [x.get(label_key, None) for x in batch]
 		labels: list[int] = []
 		for v in labels_raw:
@@ -231,6 +300,11 @@ def _build_text_collate(tokenizer_name: str = "distilbert-base-uncased", max_len
 		# Guard against the common failure mode: missing label field -> -1 labels.
 		if any(l < 0 for l in labels):
 			raise ValueError(f"Found negative labels (min={min(labels)}) for label_key='{label_key}'.")
+		# Some HF datasets use 1..C labels instead of 0..C-1. Normalize to start at 0.
+		if labels and (0 not in set(labels)):
+			mn = min(labels)
+			if mn > 0:
+				labels = [int(x - mn) for x in labels]
 		tok_out = tok(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
 		tok_out["labels"] = torch.tensor(labels, dtype=torch.long)
 		return tok_out
