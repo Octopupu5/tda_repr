@@ -192,9 +192,16 @@ def evaluate_generation_bleu(
 			batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
 
 			# Prefer prompt-only fields when provided by a collate_fn.
-			input_ids = batch.get("gen_input_ids", None) or batch.get("input_ids", None)
-			attention_mask = batch.get("gen_attention_mask", None) or batch.get("attention_mask", None)
-			labels = batch.get("gen_ref_labels", None) or batch.get("labels", None)
+			# NOTE: do NOT use `or` here: torch.Tensor truthiness is ambiguous.
+			input_ids = batch.get("gen_input_ids", None)
+			if input_ids is None:
+				input_ids = batch.get("input_ids", None)
+			attention_mask = batch.get("gen_attention_mask", None)
+			if attention_mask is None:
+				attention_mask = batch.get("attention_mask", None)
+			labels = batch.get("gen_ref_labels", None)
+			if labels is None:
+				labels = batch.get("labels", None)
 			if labels is None and "label" in batch:
 				labels = batch["label"]
 

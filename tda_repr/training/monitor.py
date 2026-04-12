@@ -22,6 +22,11 @@ class RepresentationMonitorConfig:
 	# sampling limits (per epoch, per stage, across all batches)
 	max_samples_per_stage: int = 2048
 
+	# sequence pooling for 3D activations (N, T, D)
+	# - first_token: x[:,0,:] (good for BERT-like CLS)
+	# - mean_masked: mean over tokens using attention_mask when provided (better for causal LMs)
+	seq_pooling: str = "first_token"
+
 	# downsample before heavy computations
 	max_points_for_graph: int = 256
 	max_points_for_mtopdiv: int = 600
@@ -133,7 +138,7 @@ def _first_tensor(x: Any) -> Optional["np.ndarray"]:
 	return None
 
 
-def _repr_from_tensor(t: Any) -> np.ndarray:
+def _repr_from_tensor(t: Any, attention_mask: Optional[torch.Tensor] = None, seq_pooling: str = "first_token") -> np.ndarray:
 	"""
 	Convert common activation shapes into (N, D) point cloud.
 	- (N, C, H, W) -> global avg pool -> (N, C)
@@ -157,7 +162,22 @@ def _repr_from_tensor(t: Any) -> np.ndarray:
 			x = x.mean(dim=(2, 3))
 		# (N,T,D)
 		elif x.dim() == 3:
-			x = x[:, 0, :]
+			mode = str(seq_pooling).lower().strip() or "first_token"
+			if mode == "first_token":
+				x = x[:, 0, :]
+			elif mode == "mean_masked":
+				if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 2:
+					m = attention_mask.to(device=x.device)
+					if m.shape[0] == x.shape[0] and m.shape[1] == x.shape[1]:
+						mf = m.unsqueeze(-1).float()
+						x = (x * mf).sum(dim=1) / mf.sum(dim=1).clamp_min(1.0)
+					else:
+						x = x.mean(dim=1)
+				else:
+					x = x.mean(dim=1)
+			else:
+				# safe fallback
+				x = x[:, 0, :]
 		# (N, D) ok
 		elif x.dim() == 2:
 			pass
@@ -571,17 +591,17 @@ class RepresentationMonitor:
 					self._taps = None
 		return _ctx()
 
-	def collect(self, stage: str) -> None:
+	def collect(self, stage: str, attention_mask: Optional[torch.Tensor] = None) -> None:
 		"""
 		Collect current activations from attached taps.
 		Call this after a forward pass.
+		Optionally provide attention_mask for NLP batches to enable masked pooling for 3D activations.
 		"""
 		if self._taps is None:
 			raise RuntimeError("Monitor is not attached. Use `with monitor.attach(model):`.")
 		if stage not in self._buf:
 			self._buf[stage] = {}
 			self._n[stage] = {}
-
 		for name in self.cfg.layer_names:
 			n_layer = int(self._n[stage].get(name, 0))
 			if n_layer >= int(self.cfg.max_samples_per_stage):
@@ -592,7 +612,7 @@ class RepresentationMonitor:
 			t = _first_tensor(out)
 			if t is None:
 				continue
-			X = _repr_from_tensor(t)
+			X = _repr_from_tensor(t, attention_mask=attention_mask, seq_pooling=str(self.cfg.seq_pooling))
 			remain = int(self.cfg.max_samples_per_stage) - n_layer
 			if remain <= 0:
 				continue

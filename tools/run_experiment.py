@@ -1882,6 +1882,7 @@ def main():
 		monitor_cfg = RepresentationMonitorConfig(
 			layer_names=layer_names,
 			max_samples_per_stage=args.max_samples_per_stage,
+			seq_pooling=("mean_masked" if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation") else "first_token"),
 			max_points_for_graph=args.max_points_for_graph,
 			max_points_for_mtopdiv=max(100, min(800, args.max_points_for_graph * 3)),
 			max_eigs=args.max_eigs,
@@ -2236,7 +2237,13 @@ def main():
 							lr_sched.step()
 						except Exception:
 							pass
-					monitor.collect("train")
+					attn = None
+					if _is_text_batch(batch):
+						try:
+							attn = batch.get("attention_mask", None) if hasattr(batch, "get") else None
+						except Exception:
+							attn = None
+					monitor.collect("train", attention_mask=attn)
 					train_it.set_postfix(loss=float(loss.detach().item()))
 			train_s = time.perf_counter() - t0
 
@@ -2272,7 +2279,13 @@ def main():
 							_ = model(**fwd)
 						else:
 							_ = model(**batch)
-					monitor.collect("val")
+					attn = None
+					if _is_text_batch(batch):
+						try:
+							attn = batch.get("attention_mask", None) if hasattr(batch, "get") else None
+						except Exception:
+							attn = None
+					monitor.collect("val", attention_mask=attn)
 			val_s = time.perf_counter() - t0
 
 			extra = {"train_s": float(train_s), "val_s": float(val_s), "dim2_on": bool(dim2_on), "q1_on": bool(q1_on)}
