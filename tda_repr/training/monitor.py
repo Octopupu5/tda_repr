@@ -147,7 +147,10 @@ def _repr_from_tensor(t: Any) -> np.ndarray:
 
 	with torch.no_grad():
 		x = t.detach()
+		# numpy() cannot handle bfloat16 tensors; also keep monitoring stable in fp16.
 		if x.is_floating_point() is False:
+			x = x.float()
+		elif x.dtype in (torch.bfloat16, torch.float16):
 			x = x.float()
 		# (N,C,H,W)
 		if x.dim() == 4:
