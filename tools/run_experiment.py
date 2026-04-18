@@ -1,5 +1,8 @@
 import argparse
+import ctypes
+import gc
 import os
+import platform
 import sys
 import time
 from collections.abc import Mapping
@@ -39,6 +42,37 @@ from tda_repr.models import (
 )
 from tda_repr.training import BenchmarkSpec, ExperimentTracker, RepresentationMonitor, RepresentationMonitorConfig, RunStore, TrackerConfig
 from tda_repr.viz.runlog import get_series, list_scalar_series_keys, load_epoch_end_records
+
+
+def _cleanup_memory(*, device: str = "") -> None:
+	"""
+	Best-effort memory cleanup between epochs.
+
+	This helps long runs on constrained environments (e.g., WSL) by releasing Python cycles,
+	clearing CUDA caching allocator, and (on Linux/glibc) trimming the malloc arena.
+	"""
+	gc.collect()
+	try:
+		if torch.cuda.is_available() and str(device).startswith("cuda"):
+			torch.cuda.empty_cache()
+	except Exception as e:
+		raise RuntimeError("Failed to run torch.cuda.empty_cache() during cleanup.") from e
+
+	if platform.system() == "Linux":
+		try:
+			libc = ctypes.CDLL("libc.so.6")
+			trim = getattr(libc, "malloc_trim", None)
+			if trim is not None:
+				trim(0)
+		except Exception as e:
+			# Non-fatal: trimming is best-effort and can be unavailable on some systems.
+			global _CLEANUP_TRIM_WARNED
+			if not _CLEANUP_TRIM_WARNED:
+				_CLEANUP_TRIM_WARNED = True
+				print("[Cleanup] malloc_trim failed:", str(e))
+
+
+_CLEANUP_TRIM_WARNED = False
 
 
 def _known_datasets_for_task(task: str, nlp_objective: str = "") -> List[str]:
@@ -2849,6 +2883,9 @@ def main():
 				loss_fn=loss_fn,
 				extra=extra,
 			)
+			# Release representation buffers early to keep memory stable across epochs.
+			monitor.reset_epoch()
+			_cleanup_memory(device=str(args.device))
 			# Short one-line summary for terminal visibility.
 			bench = out.get("bench", {}) or {}
 			main_key = f"{args.dataset}-val"

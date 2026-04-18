@@ -99,5 +99,7 @@ class LayerTaps:
 		for h in self._handles:
 			h.remove()
 		self._handles.clear()
+		# Ensure we drop any references to large tensors immediately.
+		self.outputs.clear()
 
 
