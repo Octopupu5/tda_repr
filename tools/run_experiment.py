@@ -18,6 +18,15 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
 	sys.path.insert(0, _ROOT)
 
+# Ensure matplotlib (used indirectly by progress plotting utilities) has a writable cache.
+_MPLCFG = os.path.join(_ROOT, ".mplconfig")
+try:
+	os.makedirs(_MPLCFG, exist_ok=True)
+	os.environ.setdefault("MPLCONFIGDIR", _MPLCFG)
+except Exception:
+	# If we cannot set it here, matplotlib will handle its own fallback.
+	pass
+
 from tda_repr.data import get_dataset, make_dataloaders
 from tda_repr.models import (
 	LayerTaps,
@@ -32,7 +41,7 @@ from tda_repr.training import BenchmarkSpec, ExperimentTracker, RepresentationMo
 from tda_repr.viz.runlog import get_series, list_scalar_series_keys, load_epoch_end_records
 
 
-def _known_datasets_for_task(task: str) -> List[str]:
+def _known_datasets_for_task(task: str, nlp_objective: str = "") -> List[str]:
 	task = str(task).lower().strip()
 	if task == "cv":
 		return [
@@ -45,14 +54,27 @@ def _known_datasets_for_task(task: str) -> List[str]:
 			"dermamnist",
 			"retinamnist",
 		]
-	return ["sst2", "ag_news", "trec6", "yahoo_answers_topics"]
+	obj = str(nlp_objective).lower().strip()
+	if obj == "generation":
+		return ["smol-summarize"]
+	# classification
+	return ["sst2", "trec6"]
 
 
-def _known_models_for_task(task: str) -> List[str]:
+def _known_models_for_task(task: str, nlp_objective: str = "") -> List[str]:
 	task = str(task).lower().strip()
 	if task == "cv":
 		return ["resnet18", "convnext_tiny", "efficientnet_b0", "mlp"]
-	return ["distilbert", "smollm2-135m", "smollm2-360m"]
+	obj = str(nlp_objective).lower().strip()
+	if obj == "generation":
+		return ["smollm2-135m", "smollm2-360m"]
+	# classification
+	return ["distilbert"]
+
+
+def _is_smollm_model_key(model_key: str) -> bool:
+	k = str(model_key).lower().strip()
+	return "smollm" in k
 
 
 def _default_device_string() -> str:
@@ -222,6 +244,25 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			continue
 
 		if step == 1:
+			# NLP: objective first (then model, then dataset).
+			if str(args.task).lower().strip() == "nlp":
+				obj_choices = ["classification", "generation"] + _back_choice(step)
+				obj = inquirer.select(
+					message="NLP objective:",
+					choices=obj_choices,
+					default=(str(args.nlp_objective) if str(args.nlp_objective) in obj_choices else "classification"),
+				).execute()
+				if obj == BACK:
+					step -= 1
+					continue
+				args.nlp_objective = str(obj)
+				# Default benchmark metrics per objective.
+				if str(args.nlp_objective) == "generation":
+					args.bench_metrics = "loss,loss_assistant_only,ppl"
+				step += 1
+				continue
+
+			# CV: dataset first (then model).
 			dataset_choices = _known_datasets_for_task(str(args.task)) + [CUSTOM] + _back_choice(step)
 			ds = inquirer.select(
 				message="Dataset:",
@@ -242,7 +283,8 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			continue
 
 		if step == 2:
-			model_choices = _known_models_for_task(str(args.task)) + [CUSTOM] + _back_choice(step)
+			# For NLP, available models depend on objective.
+			model_choices = _known_models_for_task(str(args.task), nlp_objective=str(getattr(args, "nlp_objective", ""))) + [CUSTOM] + _back_choice(step)
 			m = inquirer.select(
 				message="Model:",
 				choices=model_choices,
@@ -258,29 +300,41 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 				args.model = raw
 			else:
 				args.model = str(m)
+			# SmolLM is generation-only here and uses only SmolTalk summarize.
+			if str(args.task).lower().strip() == "nlp" and _is_smollm_model_key(str(args.model)):
+				args.dataset = "smol-summarize"
+				args.nlp_objective = "generation"
+				args.bench_metrics = "loss,loss_assistant_only,ppl"
 			step += 1
 			continue
 
 		if step == 3 and str(args.task).lower().strip() != "nlp":
-			# NLP has an extra step (objective selection) inserted at step==3.
-			# For CV we just advance to the shared next step.
+			# CV: objective doesn't exist; advance to the shared next step.
 			step += 1
 			continue
 
 		if step == 3 and str(args.task).lower().strip() == "nlp":
-			obj_choices = ["classification", "generation"] + _back_choice(step)
-			obj = inquirer.select(
-				message="NLP objective:",
-				choices=obj_choices,
-				default=(str(args.nlp_objective) if str(args.nlp_objective) in obj_choices else "classification"),
+			# NLP: dataset after objective+model. For generation it's fixed to smol-summarize.
+			if str(getattr(args, "nlp_objective", "")).lower().strip() == "generation":
+				args.dataset = "smol-summarize"
+				step += 1
+				continue
+			dataset_choices = _known_datasets_for_task(str(args.task), nlp_objective=str(args.nlp_objective)) + [CUSTOM] + _back_choice(step)
+			ds = inquirer.select(
+				message="Dataset:",
+				choices=dataset_choices,
+				default=(args.dataset if args.dataset in dataset_choices else dataset_choices[0]),
 			).execute()
-			if obj == BACK:
+			if ds == BACK:
 				step -= 1
 				continue
-			args.nlp_objective = str(obj)
-			# Sensible default benchmark metrics per objective.
-			if str(args.nlp_objective) == "generation":
-				args.bench_metrics = "loss,bleu"
+			if ds == CUSTOM:
+				raw = str(inquirer.text(message="Custom dataset key (or 'b' to go back):", default=str(args.dataset)).execute()).strip()
+				if raw.lower() in ("b", "back"):
+					continue
+				args.dataset = raw
+			else:
+				args.dataset = str(ds)
 			step += 1
 			continue
 
@@ -406,7 +460,11 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 			if str(args.task).lower().strip() != "nlp":
 				step += 1
 				continue
-			v = _ask_int("NLP: max train examples (0 = no subsample)", int(getattr(args, "nlp_max_train_examples", 0)), step)
+			if str(args.dataset).lower().strip() == "smol-summarize":
+				msg = "NLP: total examples before train/val split (0 = cap at 20k)"
+			else:
+				msg = "NLP: max train examples (0 = no subsample)"
+			v = _ask_int(msg, int(getattr(args, "nlp_max_train_examples", 0)), step)
 			if v == BACK:
 				step -= 1
 				continue
@@ -416,6 +474,11 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 
 		if step == 15:
 			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			# smol-summarize creates its own train/val split after subsampling; skip split-specific knobs here.
+			if str(args.dataset).lower().strip() == "smol-summarize":
+				args.nlp_max_val_examples = 0
 				step += 1
 				continue
 			v = _ask_int("NLP: max val examples (0 = no subsample)", int(getattr(args, "nlp_max_val_examples", 0)), step)
@@ -428,6 +491,10 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 
 		if step == 16:
 			if str(args.task).lower().strip() != "nlp":
+				step += 1
+				continue
+			if str(args.dataset).lower().strip() == "smol-summarize":
+				args.nlp_max_test_examples = 0
 				step += 1
 				continue
 			v = _ask_int("NLP: max test examples (0 = no subsample)", int(getattr(args, "nlp_max_test_examples", 0)), step)
@@ -447,6 +514,18 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 				step -= 1
 				continue
 			args.nlp_subset_seed = int(v)
+			# Generation-specific knobs (kept minimal; only asked for generation objective).
+			if str(getattr(args, "nlp_objective", "")).lower().strip() == "generation":
+				v2 = _ask_int("NLP generation: max_len (tokens)", int(getattr(args, "nlp_gen_max_len", 512)), step)
+				if v2 == BACK:
+					step -= 1
+					continue
+				args.nlp_gen_max_len = int(v2)
+				v3 = _ask_int("NLP generation: max_target_len (tokens)", int(getattr(args, "nlp_gen_max_target_len", 96)), step)
+				if v3 == BACK:
+					step -= 1
+					continue
+				args.nlp_gen_max_target_len = int(v3)
 			step += 1
 			continue
 
@@ -926,8 +1005,12 @@ def _interactive_pick_layers(current_layers: List[str], all_modules: List[str], 
 	return chosen
 
 
-def _interactive_pick_bench_metrics(current: Tuple[str, ...]) -> Tuple[str, ...]:
-	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
+def _interactive_pick_bench_metrics(current: Tuple[str, ...], *, nlp_objective: str = "") -> Tuple[str, ...]:
+	obj = str(nlp_objective).lower().strip()
+	if obj == "generation":
+		available = ["loss_assistant_only", "ppl", "loss", "bleu"]
+	else:
+		available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
 	print("\n[Interactive] Available benchmark metrics:")
 	for i, m in enumerate(available):
 		flag = "*" if m in set(current) else " "
@@ -961,8 +1044,12 @@ def _interactive_pick_layers_tui(current_layers: List[str], all_modules: List[st
 	return list(selected)
 
 
-def _interactive_pick_bench_metrics_tui(current: Tuple[str, ...]) -> Tuple[str, ...]:
-	available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
+def _interactive_pick_bench_metrics_tui(current: Tuple[str, ...], *, nlp_objective: str = "") -> Tuple[str, ...]:
+	obj = str(nlp_objective).lower().strip()
+	if obj == "generation":
+		available = ["loss_assistant_only", "ppl", "loss", "bleu"]
+	else:
+		available = ["loss", "accuracy", "precision_macro", "recall_macro", "f1_macro", "bleu"]
 	current_set = set(current)
 	choices = [Choice(value=m, name=m, enabled=(m in current_set)) for m in available]
 	selected = inquirer.checkbox(
@@ -1414,6 +1501,12 @@ def main():
 	ap.add_argument("--nlp_max_val_examples", type=int, default=0, help="If >0, subsample first N val examples for NLP datasets.")
 	ap.add_argument("--nlp_max_test_examples", type=int, default=0, help="If >0, subsample first N test examples for NLP datasets.")
 	ap.add_argument("--nlp_subset_seed", type=int, default=0, help="Seed used when subsampling NLP datasets (shuffle before selecting).")
+	# NLP generation batching (SmolLM)
+	ap.add_argument("--nlp_gen_max_len", type=int, default=512, help="Max total tokens (prompt+target+eos) for generation batching.")
+	ap.add_argument("--nlp_gen_max_target_len", type=int, default=96, help="Max target tokens for generation batching (assistant).")
+	ap.add_argument("--nlp_gen_log_token_lens", action="store_true", help="Log token length stats (max/p95/p99) for prompt/target/total.")
+	ap.add_argument("--nlp_gen_scan_token_lens", action="store_true", help="Scan the selected dataset subset and print token length stats before training.")
+	ap.add_argument("--nlp_gen_scan_token_lens_only", action="store_true", help="If set, run the token length scan and exit before training.")
 
 	# fine-tune strategies
 	ap.add_argument(
@@ -1555,6 +1648,20 @@ def main():
 		tok_name = _nlp_tokenizer_name(str(args.model)) if str(args.task).lower().strip() == "nlp" else "distilbert-base-uncased"
 		nlp_objective = str(getattr(args, "nlp_objective", "classification")).lower().strip()
 
+		# Enforce SmolLM protocol: generation-only on SmolTalk summarize.
+		if str(args.task).lower().strip() == "nlp" and _is_smollm_model_key(str(args.model)):
+			if str(nlp_objective) != "generation":
+				raise ValueError("SmolLM experiments in this repo are generation-only (nlp_objective='generation').")
+			if str(args.dataset) != "smol-summarize":
+				raise ValueError("SmolLM experiments in this repo use only dataset='smol-summarize'.")
+
+		# If user didn't override benchmark metrics for generation runs, switch to the
+		# paper's metrics: assistant-only validation loss + perplexity.
+		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+			default_cli = "loss,accuracy,precision_macro,recall_macro,f1_macro"
+			if str(getattr(args, "bench_metrics", "")).strip() == default_cli:
+				args.bench_metrics = "loss,loss_assistant_only,ppl"
+
 		nlp_tokenizer = None
 		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
 			tf = _require_transformers_runexp()
@@ -1570,18 +1677,293 @@ def main():
 						nlp_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 			except Exception:
 				pass
+			# Decoder-only generation is more reliable with left padding.
+			try:
+				nlp_tokenizer.padding_side = "left"
+			except Exception:
+				pass
 		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name=tok_name)
+		# SmolTalk summarize: choose subset size (cap 20k), then create train/val split.
+		# This uses args.nlp_max_train_examples as the TOTAL number of examples used before splitting.
+		if str(args.task).lower().strip() == "nlp" and str(args.dataset) == "smol-summarize":
+			if bundle.train is None:
+				raise RuntimeError("Dataset 'smol-summarize' failed to load (train split is None).")
+			try:
+				n_total = int(len(bundle.train))
+			except Exception as e:
+				raise RuntimeError("Dataset 'smol-summarize' does not support len().") from e
+			cap = 20000
+			want = int(args.nlp_max_train_examples) if int(args.nlp_max_train_examples) > 0 else cap
+			want = max(1, min(int(want), int(cap), int(n_total)))
+			base = bundle.train.shuffle(seed=int(args.nlp_subset_seed))
+			# Do NOT pre-truncate to `want` here. We will filter out too-long examples (no truncation),
+			# scanning the shuffled stream until we accumulate exactly `want` valid samples.
+			max_len_cfg = int(getattr(args, "nlp_gen_max_len", 512))
+			max_target_cfg = int(getattr(args, "nlp_gen_max_target_len", 96))
+			max_len_cfg = max(8, int(max_len_cfg))
+			max_target_cfg = max(1, min(int(max_target_cfg), int(max_len_cfg) - 1))
+			# Optional: scan token lengths (prompt / target / total) before training.
+			if bool(getattr(args, "nlp_gen_scan_token_lens", False)):
+				if nlp_tokenizer is None:
+					raise RuntimeError("Internal error: tokenizer is required for token length scan.")
+				eos_id = getattr(nlp_tokenizer, "eos_token_id", None)
+				if eos_id is None:
+					raise ValueError("Tokenizer is missing eos_token_id (required for causal-LM batching).")
+
+				def _prompt_target_from_messages(ex: dict) -> Optional[Tuple[str, str]]:
+					msgs = ex.get("messages", None)
+					if not isinstance(msgs, list) or not msgs:
+						return None
+					if not isinstance(msgs[0], dict):
+						return None
+					if not ("role" in msgs[0] and "content" in msgs[0]):
+						return None
+					last_assistant = None
+					for i in range(len(msgs) - 1, -1, -1):
+						role = str((msgs[i] or {}).get("role", "")).lower().strip()
+						if role == "assistant":
+							last_assistant = i
+							break
+					if last_assistant is None:
+						return None
+					target = str((msgs[last_assistant] or {}).get("content", "")).strip()
+					ctx = msgs[:last_assistant]
+					parts: List[str] = []
+					for m in ctx:
+						if not isinstance(m, dict):
+							continue
+						role = str(m.get("role", "")).strip().lower()
+						content = str(m.get("content", "")).strip()
+						if not content:
+							continue
+						if role == "system":
+							parts.append(f"System:\n{content}")
+						elif role == "user":
+							parts.append(f"User:\n{content}")
+						elif role == "assistant":
+							parts.append(f"Assistant:\n{content}")
+						else:
+							parts.append(f"{role.capitalize()}:\n{content}")
+					prompt = "\n\n".join(parts).strip()
+					prompt = (prompt + "\n\nAssistant:\n") if prompt else "Assistant:\n"
+					return prompt, target
+
+				def _lens_for_texts(texts: List[str]) -> List[int]:
+					# Use batched tokenization. Prefer 'length' if provided; else fall back to len(input_ids).
+					out = nlp_tokenizer(
+						texts,
+						add_special_tokens=False,
+						padding=False,
+						truncation=False,
+						return_length=True,
+					)
+					# transformers tokenizers return BatchEncoding (Mapping), not a plain dict.
+					if isinstance(out, Mapping) and "length" in out:
+						return [int(x) for x in out["length"]]
+					ids = out.get("input_ids", None) if isinstance(out, Mapping) else None
+					if ids is None:
+						raise ValueError("Tokenizer output did not include 'length' or 'input_ids'.")
+					return [int(len(x)) for x in ids]
+
+				p_lens: List[int] = []
+				t_lens: List[int] = []
+				tot_lens: List[int] = []
+				bs = 64
+				buf_p: List[str] = []
+				buf_t: List[str] = []
+				# Scan only the intended subset size (<=20k) for speed.
+				scan_n = int(min(int(want), int(len(base))))
+				scan_ds = base.select(range(scan_n)) if hasattr(base, "select") else base
+				for ex in scan_ds:
+					if not isinstance(ex, dict):
+						continue
+					pt = _prompt_target_from_messages(ex)
+					if pt is None:
+						continue
+					prompt, target = pt
+					if not target.strip():
+						continue
+					buf_p.append(prompt)
+					buf_t.append(target)
+					if len(buf_p) >= bs:
+						lp = _lens_for_texts(buf_p)
+						lt = _lens_for_texts(buf_t)
+						p_lens.extend(lp)
+						t_lens.extend(lt)
+						tot_lens.extend([int(a) + int(b) + 1 for a, b in zip(lp, lt)])
+						buf_p, buf_t = [], []
+				if buf_p:
+					lp = _lens_for_texts(buf_p)
+					lt = _lens_for_texts(buf_t)
+					p_lens.extend(lp)
+					t_lens.extend(lt)
+					tot_lens.extend([int(a) + int(b) + 1 for a, b in zip(lp, lt)])
+
+				def _pct(xs: List[int], q: float) -> int:
+					if not xs:
+						return 0
+					s = sorted(int(x) for x in xs)
+					i = int(max(0, min(len(s) - 1, round(q * (len(s) - 1)))))
+					return int(s[i])
+
+				max_len_cfg = int(getattr(args, "nlp_gen_max_len", 512))
+				max_target_cfg = int(getattr(args, "nlp_gen_max_target_len", 96))
+				max_target_cfg = max(1, min(int(max_target_cfg), int(max_len_cfg) - 2))
+				max_prompt_cfg = max(8, int(max_len_cfg) - int(max_target_cfg) - 1)
+				stats = {
+					"subset_n": int(len(p_lens)),
+					"prompt": {"max": max(p_lens) if p_lens else 0, "p95": _pct(p_lens, 0.95), "p99": _pct(p_lens, 0.99)},
+					"target": {"max": max(t_lens) if t_lens else 0, "p95": _pct(t_lens, 0.95), "p99": _pct(t_lens, 0.99)},
+					"total": {"max": max(tot_lens) if tot_lens else 0, "p95": _pct(tot_lens, 0.95), "p99": _pct(tot_lens, 0.99)},
+					"max_len_cfg": max_len_cfg,
+					"max_target_len_cfg": int(max_target_cfg),
+					"max_prompt_len_cfg": int(max_prompt_cfg),
+					"frac_total_gt_max_len_cfg": (sum(1 for x in tot_lens if int(x) > max_len_cfg) / float(len(tot_lens))) if tot_lens else 0.0,
+					"frac_prompt_gt_max_prompt_len_cfg": (sum(1 for x in p_lens if int(x) > max_prompt_cfg) / float(len(p_lens))) if p_lens else 0.0,
+					"frac_target_gt_max_target_len_cfg": (sum(1 for x in t_lens if int(x) > max_target_cfg) / float(len(t_lens))) if t_lens else 0.0,
+				}
+				print("[TokenLengthScan]", stats)
+				if bool(getattr(args, "nlp_gen_scan_token_lens_only", False)):
+					raise SystemExit(0)
+
+			# Filter out all examples that would be truncated under (max_len_cfg, max_target_cfg).
+			# We then take the first `want` valid samples in shuffled order.
+			if nlp_tokenizer is None:
+				raise RuntimeError("Internal error: tokenizer is required for smol-summarize filtering.")
+			eos = str(getattr(nlp_tokenizer, "eos_token", "") or "")
+			kept_pos: List[int] = []
+			n_seen = 0
+			n_bad_parse = 0
+			n_empty_target = 0
+			n_too_long_total = 0
+			n_too_long_target = 0
+
+			def _prompt_target_from_messages(msgs: Any) -> Optional[Tuple[str, str]]:
+				if not isinstance(msgs, list) or not msgs:
+					return None
+				if not isinstance(msgs[0], dict) or not ("role" in msgs[0] and "content" in msgs[0]):
+					return None
+				last_assistant = None
+				for i in range(len(msgs) - 1, -1, -1):
+					role = str((msgs[i] or {}).get("role", "")).lower().strip()
+					if role == "assistant":
+						last_assistant = i
+						break
+				if last_assistant is None:
+					return None
+				target = str((msgs[last_assistant] or {}).get("content", "")).strip()
+				ctx = msgs[:last_assistant]
+				parts: List[str] = []
+				for m in ctx:
+					if not isinstance(m, dict):
+						continue
+					role = str(m.get("role", "")).strip().lower()
+					content = str(m.get("content", "")).strip()
+					if not content:
+						continue
+					if role == "system":
+						parts.append(f"System:\n{content}")
+					elif role == "user":
+						parts.append(f"User:\n{content}")
+					elif role == "assistant":
+						parts.append(f"Assistant:\n{content}")
+					else:
+						parts.append(f"{role.capitalize()}:\n{content}")
+				prompt = "\n\n".join(parts).strip()
+				prompt = (prompt + "\n\nAssistant:\n") if prompt else "Assistant:\n"
+				return prompt, target
+
+			bs = 64
+			for start in range(0, int(len(base)), bs):
+				if len(kept_pos) >= int(want):
+					break
+				chunk = base[start : start + bs]
+				msg_list = chunk.get("messages", None) if isinstance(chunk, dict) else None
+				if not isinstance(msg_list, list):
+					continue
+				prompts: List[str] = []
+				targets: List[str] = []
+				positions: List[int] = []
+				for j, msgs in enumerate(msg_list):
+					n_seen += 1
+					pt = _prompt_target_from_messages(msgs)
+					if pt is None:
+						n_bad_parse += 1
+						continue
+					p, t = pt
+					if not t.strip():
+						n_empty_target += 1
+						continue
+					prompts.append(p)
+					targets.append(t)
+					positions.append(int(start + j))
+				if not prompts:
+					continue
+
+				full_texts = [(p + t + eos) for p, t in zip(prompts, targets)]
+				target_texts = [(t + eos) for t in targets]
+				enc_full = nlp_tokenizer(full_texts, add_special_tokens=False, padding=False, truncation=False)
+				enc_t = nlp_tokenizer(target_texts, add_special_tokens=False, padding=False, truncation=False)
+				full_ids = enc_full.get("input_ids", None) if isinstance(enc_full, Mapping) else None
+				t_ids = enc_t.get("input_ids", None) if isinstance(enc_t, Mapping) else None
+				if not isinstance(full_ids, list) or not isinstance(t_ids, list):
+					raise RuntimeError("Tokenizer did not return list input_ids for filtering.")
+
+				for pos, f_ids, tt_ids in zip(positions, full_ids, t_ids):
+					if len(kept_pos) >= int(want):
+						break
+					total_len = int(len(f_ids))
+					tlen = int(len(tt_ids))
+					if tlen > int(max_target_cfg):
+						n_too_long_target += 1
+						continue
+					if total_len > int(max_len_cfg):
+						n_too_long_total += 1
+						continue
+					kept_pos.append(int(pos))
+
+			if len(kept_pos) < int(want):
+				raise RuntimeError(
+					"Could not collect enough non-truncated smol-summarize examples under the requested limits: "
+					f"want={int(want)} got={int(len(kept_pos))}. "
+					f"Try increasing --nlp_gen_max_len/--nlp_gen_max_target_len or reducing the subset size. "
+					f"seen={int(n_seen)} bad_parse={int(n_bad_parse)} empty_target={int(n_empty_target)} "
+					f"too_long_total={int(n_too_long_total)} too_long_target={int(n_too_long_target)}."
+				)
+
+			base = base.select(kept_pos)
+			print(
+				"[SmolSummarize] selected",
+				f"n={len(base)}",
+				f"seen={n_seen}",
+				f"dropped_total={n_too_long_total}",
+				f"dropped_target={n_too_long_target}",
+				f"bad_parse={n_bad_parse}",
+				f"empty_target={n_empty_target}",
+				f"max_len={max_len_cfg}",
+				f"max_target={max_target_cfg}",
+			)
+			split = base.train_test_split(test_size=0.1, seed=int(args.nlp_subset_seed))
+			bundle.train = split["train"]
+			bundle.val = split["test"]
+			bundle.test = None
 		# Optional NLP dataset subsampling (useful for large HF datasets like yahoo_answers_topics).
 		if str(args.task).lower().strip() == "nlp":
-			bundle.train = _maybe_subsample_hf_dataset(bundle.train, int(args.nlp_max_train_examples), int(args.nlp_subset_seed))
-			bundle.val = _maybe_subsample_hf_dataset(bundle.val, int(args.nlp_max_val_examples), int(args.nlp_subset_seed))
-			bundle.test = _maybe_subsample_hf_dataset(bundle.test, int(args.nlp_max_test_examples), int(args.nlp_subset_seed))
+			# For smol-summarize we already subsampled + split above.
+			if str(args.dataset) != "smol-summarize":
+				bundle.train = _maybe_subsample_hf_dataset(bundle.train, int(args.nlp_max_train_examples), int(args.nlp_subset_seed))
+				bundle.val = _maybe_subsample_hf_dataset(bundle.val, int(args.nlp_max_val_examples), int(args.nlp_subset_seed))
+				bundle.test = _maybe_subsample_hf_dataset(bundle.test, int(args.nlp_max_test_examples), int(args.nlp_subset_seed))
 
 		# Override collate for generation objective: prompt -> target, with token-level labels.
 		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
 			if nlp_tokenizer is None:
 				raise RuntimeError("Internal error: tokenizer is required for generation objective.")
-			max_len = 128
+			# Track token length stats for the actually used subset (post-subsample, pre-split).
+			# We keep the lists small (<=20k) so it's safe to store per-example lengths.
+			token_len_prompt: List[int] = []
+			token_len_target: List[int] = []
+			token_len_total: List[int] = []
 
 			def _qa_gen_collate(batch):
 				if not batch:
@@ -1599,11 +1981,64 @@ def main():
 							parts.append(s)
 					return "\n\n".join(parts)
 
+				def _prompt_target_from_messages(ex: dict) -> Optional[Tuple[str, str]]:
+					# SmolTalk-like format: `messages` = list[{role, content}]
+					for k in ("messages", "conversation", "conversations"):
+						msgs = ex.get(k, None)
+						if not isinstance(msgs, list) or not msgs:
+							continue
+						if not isinstance(msgs[0], dict):
+							continue
+						if not ("role" in msgs[0] and "content" in msgs[0]):
+							continue
+
+						last_assistant = None
+						for i in range(len(msgs) - 1, -1, -1):
+							role = str((msgs[i] or {}).get("role", "")).lower().strip()
+							if role in ("assistant", "bot", "gpt"):
+								last_assistant = i
+								break
+						if last_assistant is None:
+							return None
+
+						target = str((msgs[last_assistant] or {}).get("content", "")).strip()
+						ctx = msgs[:last_assistant]
+						parts: List[str] = []
+						for m in ctx:
+							if not isinstance(m, dict):
+								continue
+							role = str(m.get("role", "")).strip().lower()
+							content = str(m.get("content", "")).strip()
+							if not content:
+								continue
+							if role == "system":
+								parts.append(f"System:\n{content}")
+							elif role == "user":
+								parts.append(f"User:\n{content}")
+							elif role == "assistant":
+								parts.append(f"Assistant:\n{content}")
+							else:
+								parts.append(f"{role.capitalize()}:\n{content}")
+						prompt = "\n\n".join(parts).strip()
+						if prompt:
+							prompt = prompt + "\n\nAssistant:\n"
+						else:
+							prompt = "Assistant:\n"
+						return prompt, target
+					return None
+
 				prompts = []
 				targets = []
 				for ex in batch:
 					if not isinstance(ex, dict):
 						continue
+					mt = _prompt_target_from_messages(ex)
+					if mt is not None:
+						prompt, target = mt
+						prompts.append(prompt)
+						targets.append(target)
+						continue
+
 					# Yahoo Answers Topics fields (preferred)
 					q = _get_text(ex, ["question_title", "question_content"])
 					a = _get_text(ex, ["best_answer"])
@@ -1612,34 +2047,76 @@ def main():
 						q = _get_text(ex, ["question", "prompt", "text"])
 					if not a:
 						a = _get_text(ex, ["answer", "target", "text"])
+					if not q or not a:
+						raise ValueError(f"Could not infer prompt/target fields from keys={list(ex.keys())}")
 					prompt = f"Question:\n{q}\n\nAnswer:\n"
 					prompts.append(prompt)
 					targets.append(a)
 
-				# For generation eval: prompt-only inputs + reference target labels
-				prompt_enc = nlp_tokenizer(prompts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
-				ref_enc = nlp_tokenizer(targets, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
-				ref_labels = ref_enc["input_ids"].clone()
-				if "attention_mask" in ref_enc:
-					ref_labels[ref_enc["attention_mask"] == 0] = -100
+				import torch
 
-				# For training loss: full sequence with prompt masked out in labels
-				eos = getattr(nlp_tokenizer, "eos_token", "") or ""
-				full_texts = [(p + t + eos) for p, t in zip(prompts, targets)]
-				full_enc = nlp_tokenizer(full_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+				# We intentionally avoid tokenizer.pad(...) here to suppress the fast-tokenizer warning
+				# and use the tokenizer __call__ API with padding=True.
+				eos = str(getattr(nlp_tokenizer, "eos_token", "") or "")
+
+				full_texts: List[str] = []
+				prompt_texts: List[str] = []
+				target_texts: List[str] = []
+				for p, t in zip(prompts, targets):
+					if not str(t).strip():
+						continue
+					prompt_texts.append(str(p))
+					target_texts.append(str(t) + eos)
+					full_texts.append(str(p) + str(t) + eos)
+				if not full_texts:
+					raise ValueError("All samples in batch had empty targets; cannot build generation batch.")
+
+				prompt_enc = nlp_tokenizer(
+					prompt_texts,
+					add_special_tokens=False,
+					padding=True,
+					truncation=False,
+					return_tensors="pt",
+				)
+				full_enc = nlp_tokenizer(
+					full_texts,
+					add_special_tokens=False,
+					padding=True,
+					truncation=False,
+					return_tensors="pt",
+				)
+				target_enc = nlp_tokenizer(
+					target_texts,
+					add_special_tokens=False,
+					padding=True,
+					truncation=False,
+					return_tensors="pt",
+				)
+
+				# Labels: full input ids with prompt masked out (-100), plus pad masked out.
 				labels = full_enc["input_ids"].clone()
-				if "attention_mask" in full_enc:
-					labels[full_enc["attention_mask"] == 0] = -100
-				prompt_lens = prompt_enc["attention_mask"].sum(dim=1).tolist() if "attention_mask" in prompt_enc else [0] * labels.shape[0]
+				labels[full_enc["attention_mask"] == 0] = -100
+				prompt_lens = prompt_enc["attention_mask"].sum(dim=1).tolist()
 				for i, pl in enumerate(prompt_lens):
 					pl = int(pl)
 					if pl > 0:
 						labels[i, :pl] = -100
 
+				# Optional: track length stats.
+				if bool(getattr(args, "nlp_gen_log_token_lens", False)):
+					try:
+						token_len_prompt.extend([int(x) for x in prompt_enc["attention_mask"].sum(dim=1).tolist()])
+						token_len_target.extend([int(x) for x in target_enc["attention_mask"].sum(dim=1).tolist()])
+						token_len_total.extend([int(x) for x in full_enc["attention_mask"].sum(dim=1).tolist()])
+					except Exception:
+						pass
+
 				out = dict(full_enc)
 				out["labels"] = labels
-				out["gen_input_ids"] = prompt_enc.get("input_ids")
-				out["gen_attention_mask"] = prompt_enc.get("attention_mask")
+				out["gen_input_ids"] = prompt_enc["input_ids"]
+				out["gen_attention_mask"] = prompt_enc["attention_mask"]
+				ref_labels = target_enc["input_ids"].clone()
+				ref_labels[target_enc["attention_mask"] == 0] = -100
 				out["gen_ref_labels"] = ref_labels
 				return out
 
@@ -1727,7 +2204,7 @@ def main():
 		if args.interactive and not args.list_layers_only:
 			if str(args.interactive_ui) == "tui":
 				layer_names = _interactive_pick_layers_tui(layer_names, all_modules, model)
-				bench_metrics = _interactive_pick_bench_metrics_tui(tuple(bench_metrics))
+				bench_metrics = _interactive_pick_bench_metrics_tui(tuple(bench_metrics), nlp_objective=str(nlp_objective))
 				args.compute_mtopdiv = bool(
 					inquirer.confirm(
 						message="Enable MTopDiv?",
@@ -1742,7 +2219,7 @@ def main():
 				)
 			else:
 				layer_names = _interactive_pick_layers(layer_names, all_modules, model)
-				bench_metrics = _interactive_pick_bench_metrics(tuple(bench_metrics))
+				bench_metrics = _interactive_pick_bench_metrics(tuple(bench_metrics), nlp_objective=str(nlp_objective))
 				# Optional toggles for expensive metrics.
 				args.compute_mtopdiv = _prompt_yes_no("Enable MTopDiv?", bool(args.compute_mtopdiv))
 				args.compute_gudhi = _prompt_yes_no("Enable GUDHI PH?", bool(args.compute_gudhi))
@@ -2216,6 +2693,14 @@ def main():
 					else:
 						continue
 
+					# Fail fast on NaNs/Infs (common when a batch has zero supervised tokens).
+					try:
+						if isinstance(loss, torch.Tensor) and not torch.isfinite(loss).all():
+							raise ValueError("Non-finite loss (NaN/Inf) encountered. Likely cause: batch has no assistant tokens after truncation/masking.")
+					except Exception:
+						# If isfinite check fails for any reason, let the loss value surface naturally.
+						pass
+
 					# Optional differentiable regularizer on a chosen layer
 					if args.reg_kind == "graph_smoothness" and args.reg_weight > 0 and reg_layer:
 						act = taps.outputs.get(reg_layer, None)
@@ -2303,7 +2788,8 @@ def main():
 			acc = mm.get("accuracy", None)
 			f1 = mm.get("f1_macro", None)
 			bleu = mm.get("bleu", None)
-			los = mm.get("loss", None)
+			los = mm.get("loss_assistant_only", mm.get("loss", None))
+			ppl = mm.get("ppl", None)
 			err = mm.get("error", None)
 			rep_s = float(((out.get("timing_s", {}) or {}).get("repr_end_epoch", 0.0) or 0.0))
 			bench_s = float(((out.get("timing_s", {}) or {}).get("bench_total", 0.0) or 0.0))
@@ -2311,7 +2797,7 @@ def main():
 			err_str = f" val_error={err}" if err else ""
 			if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
 				print(
-					f"[Epoch {epoch}] val_loss={los} val_bleu={bleu} "
+					f"[Epoch {epoch}] val_loss_assistant_only={los} val_ppl={ppl} val_bleu={bleu} "
 					f"train_s={train_s:.2f} val_s={val_s:.2f} repr_s={rep_s:.2f} bench_s={bench_s:.2f} epoch_s={epoch_s:.2f}"
 					f"{err_str}"
 				)
@@ -2487,6 +2973,24 @@ def main():
 				},
 			},
 		)
+		# Token length stats for SmolLM generation (computed on-the-fly inside collate).
+		if str(args.task).lower().strip() == "nlp" and str(nlp_objective) == "generation" and bool(getattr(args, "nlp_gen_log_token_lens", False)):
+			def _pct(xs: List[int], q: float) -> int:
+				if not xs:
+					return 0
+				s = sorted(int(x) for x in xs)
+				i = int(max(0, min(len(s) - 1, round(q * (len(s) - 1)))))
+				return int(s[i])
+			stats = {
+				"max_len_cfg": int(getattr(args, "nlp_gen_max_len", 0) or 0),
+				"max_target_len_cfg": int(getattr(args, "nlp_gen_max_target_len", 0) or 0),
+				"n_samples_seen": int(len(token_len_total)),
+				"prompt": {"max": max(token_len_prompt) if token_len_prompt else 0, "p95": _pct(token_len_prompt, 0.95), "p99": _pct(token_len_prompt, 0.99)},
+				"target": {"max": max(token_len_target) if token_len_target else 0, "p95": _pct(token_len_target, 0.95), "p99": _pct(token_len_target, 0.99)},
+				"total": {"max": max(token_len_total) if token_len_total else 0, "p95": _pct(token_len_total, 0.95), "p99": _pct(token_len_total, 0.99)},
+			}
+			store.log("token_length_stats", stats)
+			print("[TokenLengthStats]", stats)
 
 		# Auto correlation report (replaces lightweight auto-correlation summary).
 		from tools.correlation_report import generate_correlation_report
@@ -2496,6 +3000,7 @@ def main():
 			out_dir=os.path.join(store.run_dir, "correlations_report"),
 			min_common_epochs=3,
 			top_k=100,
+			negate_bench_loss=(str(args.task).lower().strip() == "nlp" and str(nlp_objective) == "generation"),
 		)
 		store.log("correlation_report", corr_report)
 		print(f"[Done] run_dir={store.run_dir}")

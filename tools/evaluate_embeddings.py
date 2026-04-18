@@ -19,6 +19,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from collections.abc import Mapping
+import textwrap
+from matplotlib.gridspec import GridSpec
 
 # Allow running as a script: ensure project root (parent of /tools) is on sys.path
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -33,6 +35,8 @@ from tools.run_experiment import (
 	_infer_num_classes,
 	_repr_from_activation,
 )
+
+_ILLUSTRATION_VERSION = 2
 
 
 def _load_meta(run_dir: str) -> Dict[str, Any]:
@@ -242,6 +246,7 @@ def _can_reuse_layer_report(
 	seed: int,
 	max_batches: int,
 	max_samples: int,
+	require_illustration: bool,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
 	if not os.path.exists(layer_json_path):
 		return False, None
@@ -271,6 +276,18 @@ def _can_reuse_layer_report(
 		return False, None
 	if int(obj.get("max_samples", 0)) != int(max_samples):
 		return False, None
+	if bool(require_illustration):
+		ill = obj.get("illustration_path", None)
+		# If illustration is missing or the file is absent, force recompute to generate PNG.
+		if not ill:
+			return False, None
+		if int(obj.get("illustration_version", 0) or 0) != int(_ILLUSTRATION_VERSION):
+			return False, None
+		try:
+			if not os.path.exists(str(ill)):
+				return False, None
+		except Exception:
+			return False, None
 	return True, obj
 
 
@@ -523,6 +540,151 @@ def _fetch_dataset_image(dataset: Any, idx: int) -> torch.Tensor:
 	return x.float()
 
 
+def _fetch_dataset_text(dataset: Any, idx: int) -> str:
+	"""
+	Best-effort extraction of a human-readable text field from a dataset item.
+	Works for common HF text datasets (SST-2, AG News, Yahoo Answers Topics, etc.).
+	"""
+	ex = dataset[int(idx)]
+	# Some wrappers may return (text, label) or similar.
+	if isinstance(ex, (tuple, list)) and ex:
+		for it in ex:
+			if isinstance(it, str) and it.strip():
+				return str(it)
+		# fallback to first element
+		ex = ex[0]
+	if isinstance(ex, str):
+		return ex
+	if not isinstance(ex, dict):
+		return str(ex)
+
+	def _get(k: str) -> str:
+		v = ex.get(k, "")
+		s = str(v).strip()
+		return s
+
+	# Yahoo Answers Topics: join fields (question + answer)
+	if any(k in ex for k in ("question_title", "question_content", "best_answer")):
+		parts = []
+		for k in ("question_title", "question_content", "best_answer"):
+			s = _get(k)
+			if s:
+				parts.append(s)
+		if parts:
+			return "\n\n".join(parts)
+
+	# Common single-field datasets
+	for k in ("text", "sentence", "content", "question", "review", "prompt"):
+		s = _get(k)
+		if s:
+			return s
+
+	# Fallback: first non-empty string-ish field
+	for k, v in ex.items():
+		if isinstance(v, str) and v.strip():
+			return v.strip()
+	return str(ex)
+
+
+def _make_layer_illustration_text(
+	out_path: str,
+	dataset: Any,
+	labels: torch.Tensor,
+	anchor_idx: int,
+	anchor_class: int,
+	neighbor_indices: List[int],
+) -> None:
+	"""
+	Render a compact, readable layout:
+	- Anchor text (yellow) spans full width at the top.
+	- Up to 20 neighbors below in 2 columns (green same class, red different class).
+	"""
+	# Use readable colors on white background.
+	col_anchor = "#C9A227"  # golden/yellow
+	col_ok = "#228B22"  # forest green
+	col_bad = "#B22222"  # firebrick
+
+	def _clean(s: str) -> str:
+		s = str(s).replace("\r\n", "\n").replace("\r", "\n").strip()
+		paras = []
+		for p in s.split("\n"):
+			p2 = " ".join(p.split()).strip()
+			if p2:
+				paras.append(p2)
+		return "\n\n".join(paras)
+
+	anchor_id = int(anchor_idx)
+	neighbor_ids = [int(i) for i in neighbor_indices[:20]]
+	nn = len(neighbor_ids)
+
+	# Figure geometry: anchor row + up to 10 neighbor rows.
+	n_rows = 1 + int(np.ceil(max(1, nn) / 2.0))
+	fig_h = 1.55 + 0.72 * (n_rows - 1)
+	fig = plt.figure(figsize=(14.0, fig_h))
+	gs = GridSpec(
+		nrows=n_rows,
+		ncols=2,
+		figure=fig,
+		height_ratios=[1.55] + [0.72] * (n_rows - 1),
+		wspace=0.03,  # tighter columns
+		hspace=0.22,
+	)
+
+	def _draw_cell(ax, sid: int, color: str, is_anchor: bool) -> None:
+		ax.axis("off")
+		lab = int(labels[sid].item())
+		txt = _clean(_fetch_dataset_text(dataset, sid))
+		if not txt:
+			txt = "[empty]"
+		if is_anchor:
+			max_chars = 520
+			wrap_w = 96
+			fs = 9.6
+		else:
+			max_chars = 190
+			wrap_w = 58
+			fs = 8.6
+		if len(txt) > max_chars:
+			txt = txt[: max_chars - 1] + "…"
+		prefix = f"id={sid} y={lab} — "
+		wrap = textwrap.TextWrapper(width=wrap_w, break_long_words=False, break_on_hyphens=False)
+		wrapped = wrap.fill(prefix + txt)
+		ax.text(
+			0.01,
+			0.98,
+			wrapped,
+			va="top",
+			ha="left",
+			transform=ax.transAxes,
+			fontsize=fs,
+			color=color,
+			wrap=True,
+			bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="#DDDDDD", linewidth=0.8),
+		)
+
+	# Anchor spans both columns.
+	ax0 = fig.add_subplot(gs[0, :])
+	_draw_cell(ax0, anchor_id, col_anchor, is_anchor=True)
+
+	# Neighbors in 2 columns.
+	for r in range(1, n_rows):
+		for c in range(2):
+			j = (r - 1) + (n_rows - 1) * c
+			ax = fig.add_subplot(gs[r, c])
+			ax.axis("off")
+			if j >= nn:
+				continue
+			sid = neighbor_ids[j]
+			lab = int(labels[sid].item())
+			color = col_ok if lab == int(anchor_class) else col_bad
+			_draw_cell(ax, sid, color, is_anchor=False)
+
+	fig.suptitle("Anchor (yellow) and nearest neighbors (green/red)", fontsize=10.5)
+	fig.tight_layout(rect=(0, 0, 1, 0.965))
+	fig.savefig(out_path)
+	plt.close(fig)
+
+
 def _make_layer_illustration(
 	out_path: str,
 	dataset: Any,
@@ -660,11 +822,15 @@ def main() -> None:
 		tokenizer_name = "distilbert-base-uncased"
 	bundle = get_dataset(dataset, root=data_root, download=bool(args.download), tokenizer_name=tokenizer_name)
 	loaders = make_dataloaders(bundle, batch_size=batch_size, num_workers=0)
-	loader = loaders.get(str(args.split))
-	if loader is None and str(args.split) == "test":
+	requested_split = str(args.split)
+	loader = loaders.get(requested_split)
+	# Fallback for datasets where test split is unlabeled (common for GLUE/SST-2).
+	# We'll detect this later too (negative-label error or empty valid labels) and switch to val.
+	if loader is None and requested_split == "test":
 		loader = loaders.get("val")
 	if loader is None:
 		raise RuntimeError(f"No dataloader for split '{args.split}'.")
+	effective_split = requested_split if loaders.get(requested_split) is not None else "val"
 
 	num_classes = int(payload.get("num_classes", meta.get("num_classes", 0)) or 0)
 	if num_classes <= 0:
@@ -739,6 +905,7 @@ def main() -> None:
 					seed=int(args.seed),
 					max_batches=int(args.max_batches),
 					max_samples=int(args.max_samples),
+					require_illustration=True,
 				)
 				if reuse_ok and isinstance(reuse_obj, dict):
 					reuse_obj["layer_report_path"] = layer_json
@@ -754,20 +921,47 @@ def main() -> None:
 	# Compute the remaining layers in a single pass over the loader.
 	emb_by_layer: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 	if layers_to_compute:
-		try:
-			emb_by_layer = _collect_embeddings_and_labels_many(
+		def _try_collect(_loader) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+			return _collect_embeddings_and_labels_many(
 				model=model,
-				loader=loader,
+				loader=_loader,
 				layer_names=layers_to_compute,
 				preprocess=preprocess,
 				device=device,
 				max_batches=int(args.max_batches),
 				max_samples=int(args.max_samples),
 			)
+
+		try:
+			emb_by_layer = _try_collect(loader)
 		except Exception as e:
-			for layer in layers_to_compute:
-				layer_reports.append({"layer": str(layer), "error": str(e)})
-			emb_by_layer = {}
+			msg = str(e)
+			# If NLP test split has unknown labels (-1) and collate is strict, fall back to val.
+			if task == "nlp" and requested_split == "test":
+				val_loader = loaders.get("val")
+				if val_loader is not None and (
+					("Found negative labels" in msg)
+					or ("negative labels" in msg.lower())
+					or ("no valid labeled" in msg.lower())
+					or ("Could not collect embeddings" in msg)
+				):
+					print("[EmbeddingEval] test split appears unlabeled (e.g. label=-1); using val split instead.")
+					loader = val_loader
+					effective_split = "val"
+					try:
+						emb_by_layer = _try_collect(loader)
+					except Exception as e2:
+						for layer in layers_to_compute:
+							layer_reports.append({"layer": str(layer), "error": str(e2)})
+						emb_by_layer = {}
+				else:
+					for layer in layers_to_compute:
+						layer_reports.append({"layer": str(layer), "error": msg})
+					emb_by_layer = {}
+			else:
+				for layer in layers_to_compute:
+					layer_reports.append({"layer": str(layer), "error": msg})
+				emb_by_layer = {}
 
 	# Choose anchors once (using any successfully collected layer).
 	labels_np = None
@@ -840,6 +1034,16 @@ def main() -> None:
 					neighbor_indices=list(illustr["neighbor_indices"]),
 				)
 				illustr_path = layer_png
+			elif task == "nlp":
+				_make_layer_illustration_text(
+					out_path=layer_png,
+					dataset=loader.dataset,
+					labels=labels,
+					anchor_idx=int(anchor_idx_for_illustration),
+					anchor_class=int(anchor_class_for_illustration),
+					neighbor_indices=list(illustr["neighbor_indices"]),
+				)
+				illustr_path = layer_png
 
 			row = {
 				"layer": str(layer),
@@ -858,7 +1062,9 @@ def main() -> None:
 					"neighbor_indices": [int(x) for x in illustr["neighbor_indices"]],
 				},
 				"illustration_path": illustr_path,
-				"split": str(args.split),
+				"illustration_version": int(_ILLUSTRATION_VERSION) if illustr_path else None,
+				"split": str(requested_split),
+				"effective_split": str(effective_split),
 				"top_k": int(args.top_k),
 				"seed": int(args.seed),
 				"max_batches": int(args.max_batches),
@@ -878,7 +1084,8 @@ def main() -> None:
 	summary = {
 		"run_dir": run_dir,
 		"checkpoint": ckpt_path,
-		"split": str(args.split),
+		"split": str(requested_split),
+		"effective_split": str(effective_split),
 		"top_k": int(args.top_k),
 		"anchors_per_class": int(args.anchors_per_class),
 		"seed": int(args.seed),

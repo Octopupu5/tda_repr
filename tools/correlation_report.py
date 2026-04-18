@@ -87,6 +87,7 @@ def generate_correlation_report(
 	bench_contains: str = "",
 	repr_contains: str = "",
 	spectral_max_lambda_k: int = 3,
+	negate_bench_loss: bool = False,
 ) -> Dict[str, object]:
 	metrics_path = os.path.join(run_dir, "metrics.jsonl")
 	recs = load_epoch_end_records(metrics_path)
@@ -109,6 +110,10 @@ def generate_correlation_report(
 	pairs = []
 	for bk in bench_keys:
 		sb = _series_map(epoch_maps, bk)
+		# For objectives where "lower is better" (e.g., validation loss), it is often
+		# more intuitive to correlate against -loss so that "better" aligns with larger values.
+		if bool(negate_bench_loss) and (bk.endswith(".loss") or bk.endswith(".loss_assistant_only")):
+			sb = {e: -float(v) for e, v in sb.items()}
 		for rk in repr_keys:
 			sr = _series_map(epoch_maps, rk)
 			common = sorted(set(sb.keys()) & set(sr.keys()))
@@ -178,6 +183,7 @@ def main() -> None:
 	ap.add_argument("--bench_contains", type=str, default="")
 	ap.add_argument("--repr_contains", type=str, default="")
 	ap.add_argument("--spectral_max_lambda_k", type=int, default=3)
+	ap.add_argument("--negate_bench_loss", action="store_true", help="Correlate against -loss for bench.*.loss keys.")
 	args = ap.parse_args()
 
 	out = generate_correlation_report(
@@ -188,6 +194,7 @@ def main() -> None:
 		bench_contains=str(args.bench_contains),
 		repr_contains=str(args.repr_contains),
 		spectral_max_lambda_k=int(args.spectral_max_lambda_k),
+		negate_bench_loss=bool(args.negate_bench_loss),
 	)
 	print(f"[CorrelationReport] saved to: {out['out_dir']}")
 	print(f"[CorrelationReport] pairs={out['pairs']} top={out['top']}")

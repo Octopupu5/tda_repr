@@ -442,6 +442,28 @@ def get_dataset(
 			traceback.print_exc()
 			return DataBundle(name="trec6", train=None, val=None, test=None, collate_fn=None)
 
+	# SmolTalk (chat-style) for causal-LM / generation experiments.
+	# Dataset page: HuggingFaceTB/smoltalk (subset/config: smol-summarize).
+	# NOTE: We return only a train split here; `tools/run_experiment.py` performs
+	# the train/val split AFTER optional subsampling so the subset size can be chosen in the TUI.
+	if key in ("smol-summarize", "smol_summarize", "smol_summarize_v0"):
+		try:
+			if load_dataset is None:
+				raise ModuleNotFoundError("datasets")
+			dd = load_dataset("HuggingFaceTB/smoltalk", "smol-summarize")
+			base = None
+			if isinstance(dd, dict) and "train" in dd:
+				base = dd["train"]
+			elif isinstance(dd, dict) and dd:
+				base = dd[sorted(dd.keys())[0]]
+			else:
+				raise ValueError("Unexpected dataset object from load_dataset('HuggingFaceTB/smoltalk', 'smol-summarize').")
+			return DataBundle(name="smol-summarize", train=base, val=None, test=None, collate_fn=None)
+		except Exception as e:
+			print("[HF] Failed to load dataset 'HuggingFaceTB/smoltalk' (config='smol-summarize'):", e)
+			traceback.print_exc()
+			return DataBundle(name="smol-summarize", train=None, val=None, test=None, collate_fn=None)
+
 	# Unknown dataset; user can pass their own later
 	return DataBundle(name=key, train=None, val=None, test=None, collate_fn=None)
 

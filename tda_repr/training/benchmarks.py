@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 from collections.abc import Mapping
 
+import math
 import sacrebleu
 import torch
 
@@ -212,14 +213,12 @@ def evaluate_generation_bleu(
 
 			# Optional loss on full input/labels (if present).
 			if ("input_ids" in batch) and ("labels" in batch):
-				try:
-					fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
-					out = model(**fwd)
-					if hasattr(out, "loss") and out.loss is not None:
-						loss_sum += float(out.loss.item())
-						loss_n += 1
-				except Exception:
-					pass
+				fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
+				out = model(**fwd)
+				if not (hasattr(out, "loss") and out.loss is not None):
+					raise ValueError("Generation benchmark expected model forward to return .loss when 'labels' are provided.")
+				loss_sum += float(out.loss.item())
+				loss_n += 1
 
 			gen_ids = model.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
 			if not isinstance(gen_ids, torch.Tensor):
@@ -241,5 +240,13 @@ def evaluate_generation_bleu(
 	bleu = sacrebleu.corpus_bleu(hyp, [ref])
 	out = {"bleu": float(bleu.score)}
 	if loss_n > 0:
-		out["loss"] = loss_sum / loss_n
+		# For our generation objective, the collate_fn masks the prompt tokens with -100,
+		# so this loss reflects assistant-only tokens.
+		loss = float(loss_sum / loss_n)
+		out["loss"] = loss
+		out["loss_assistant_only"] = loss
+		try:
+			out["ppl"] = float(math.exp(loss))
+		except OverflowError:
+			out["ppl"] = float("inf")
 	return out
