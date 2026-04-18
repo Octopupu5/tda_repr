@@ -2709,7 +2709,10 @@ def main():
 		early_signal_epoch: Optional[int] = None
 		early_signal_main_metric: Optional[float] = None
 
-		best = {"metric": -1.0, "epoch": -1, "bench": "", "metric_name": ""}
+		# Best checkpoint tracking. We always keep "score higher is better":
+		# - for metrics to minimize (loss/ppl) we use negative values
+		# - for metrics to maximize (accuracy/f1/bleu) we use the raw value
+		best = {"metric": -float("inf"), "epoch": -1, "bench": "", "metric_name": ""}
 		t0_total = time.perf_counter()
 		for epoch in range(int(args.epochs)):
 			t_epoch0 = time.perf_counter()
@@ -3016,16 +3019,39 @@ def main():
 				m = evaluate_classification(model, noisy_val_loader, loss_fn=loss_fn, max_batches=(args.max_val_batches or None))
 				store.log("noisy_val", {"epoch": epoch, "sigma": float(args.cv_noise_sigma), "metrics": m})
 
-			# Track best by f1_macro if available, else accuracy.
-			if "f1_macro" in mm:
-				score = float(mm.get("f1_macro", -1.0) or -1.0)
-				main_metric_name = "f1_macro"
-			elif "accuracy" in mm:
-				score = float(mm.get("accuracy", -1.0) or -1.0)
-				main_metric_name = "accuracy"
+			# Track best checkpoint.
+			# Generation runs should minimize ppl/loss, while classification runs maximize f1/accuracy.
+			if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+				ppl_v = mm.get("ppl", None)
+				loss_a = mm.get("loss_assistant_only", None)
+				loss_v = mm.get("loss", None)
+				bleu_v = mm.get("bleu", None)
+				if ppl_v is not None:
+					score = -float(ppl_v)
+					main_metric_name = "ppl_min"
+				elif loss_a is not None:
+					score = -float(loss_a)
+					main_metric_name = "loss_assistant_only_min"
+				elif loss_v is not None:
+					score = -float(loss_v)
+					main_metric_name = "loss_min"
+				elif bleu_v is not None:
+					score = float(bleu_v)
+					main_metric_name = "bleu"
+				else:
+					score = -float("inf")
+					main_metric_name = "none"
 			else:
-				score = -float(mm.get("loss", 1e9) or 1e9)
-				main_metric_name = "loss_neg"
+				# Classification: maximize f1_macro if available, else accuracy; fallback to minimizing loss.
+				if "f1_macro" in mm:
+					score = float(mm.get("f1_macro", -1.0) or -1.0)
+					main_metric_name = "f1_macro"
+				elif "accuracy" in mm:
+					score = float(mm.get("accuracy", -1.0) or -1.0)
+					main_metric_name = "accuracy"
+				else:
+					score = -float(mm.get("loss", 1e9) or 1e9)
+					main_metric_name = "loss_min"
 			if score > best["metric"]:
 				best = {"metric": score, "epoch": int(epoch), "bench": main_key, "metric_name": main_metric_name}
 				store.log("best_so_far", {"epoch": int(epoch), "metric": float(score), "bench": main_key})
