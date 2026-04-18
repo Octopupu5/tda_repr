@@ -87,6 +87,49 @@ def _schedule(epoch: int, base: bool, every: int) -> bool:
 	return bool(base)
 
 
+def _linear_warmup_decay_factor(step: int, *, warmup_steps: int, total_steps: int) -> float:
+	"""
+	Linear warmup then linear decay to 0.
+
+	This matches the logic used in tools/run_experiment.py for the LambdaLR schedule.
+	"""
+	step = int(step)
+	warmup_steps = int(max(0, warmup_steps))
+	total_steps = int(max(1, total_steps))
+	if warmup_steps > 0 and step < warmup_steps:
+		return float(step) / float(max(1, warmup_steps))
+	den = float(max(1, total_steps - warmup_steps))
+	return max(0.0, float(total_steps - step) / den)
+
+
+def _set_optimizer_lr(opt: torch.optim.Optimizer, lr: float) -> None:
+	for pg in opt.param_groups:
+		pg["lr"] = float(lr)
+
+
+def _lr_for_next_optimizer_step(
+	*,
+	base_lr: float,
+	global_step: int,
+	sched_kind: str,
+	warmup_steps: int,
+	total_steps: int,
+) -> float:
+	"""
+	Return the LR that should be active *before* the next optimizer.step().
+
+	tools/run_experiment.py calls scheduler.step() after optimizer.step(). Therefore after k optimizer
+	steps, the scheduler has been stepped k times and the optimizer LR equals factor(k-1) (except k=0).
+	"""
+	k = int(global_step)
+	if str(sched_kind) != "linear":
+		return float(base_lr)
+	if k <= 0:
+		return float(base_lr)
+	f = _linear_warmup_decay_factor(k - 1, warmup_steps=int(warmup_steps), total_steps=int(total_steps))
+	return float(base_lr) * float(f)
+
+
 def _build_generation_tokenizer(model_name_or_path: str) -> Any:
 	from transformers import AutoTokenizer
 
@@ -287,6 +330,13 @@ def main() -> None:
 	ap = argparse.ArgumentParser()
 	ap.add_argument("--run_dir", type=str, required=True, help="Existing run directory under runs/..., containing checkpoints/ and metrics.jsonl")
 	ap.add_argument("--device", type=str, default="", help="Override device (e.g. cuda:0). If empty, uses device from checkpoint.")
+	ap.add_argument(
+		"--planned_total_epochs",
+		type=int,
+		default=0,
+		help="If >0, override the linear LR schedule total_steps as planned_total_epochs * steps_per_epoch. "
+		"Use this when you originally ran only 1 epoch (so total_steps was 1*steps_per_epoch and LR decayed to 0).",
+	)
 	args_cli = ap.parse_args()
 
 	root = _project_root()
@@ -400,34 +450,53 @@ def main() -> None:
 	opt.load_state_dict(opt_state)
 	_optimizer_to_device(opt, device=device)
 
-	lr_sched = None
 	sched_d = payload.get("scheduler", {}) or {}
 	if not isinstance(sched_d, dict):
 		raise TypeError("payload['scheduler'] must be a dict.")
-	if str(sched_d.get("kind", "none")) == "linear":
-		warmup_steps = int(sched_d.get("warmup_steps", 0) or 0)
-		total_steps = int(sched_d.get("total_steps", 1) or 1)
-
-		def _lr_lambda(step: int) -> float:
-			if warmup_steps > 0 and step < warmup_steps:
-				return float(step) / float(max(1, warmup_steps))
-			den = float(max(1, total_steps - warmup_steps))
-			return max(0.0, float(total_steps - step) / den)
-
-		lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
-		sd = obj.get("lr_scheduler", None)
-		if not isinstance(sd, dict):
-			raise KeyError("Checkpoint payload expects 'lr_scheduler' state dict for linear scheduler.")
-		lr_sched.load_state_dict(sd)
+	sched_kind = str(sched_d.get("kind", "none"))
+	warmup_steps = int(sched_d.get("warmup_steps", 0) or 0)
+	total_steps = int(sched_d.get("total_steps", 1) or 1)
 
 	last_epoch = int(obj.get("epoch", -1))
 	global_step = int(obj.get("global_step", 0))
 	next_epoch = last_epoch + 1
+
+	# Determine steps_per_epoch for schedule override (needed for per-epoch manual runs).
+	max_train_batches = int(ckpt_args.get("max_train_batches", 0) or 0)
 	try:
-		cur_lr = float(opt.param_groups[0].get("lr", float("nan")))
+		steps_per_epoch = int(len(train_loader))
 	except Exception:
-		cur_lr = float("nan")
-	print(f"[ResumeOneEpoch] start epoch={next_epoch} global_step={global_step} lr={cur_lr}")
+		steps_per_epoch = 0
+	if max_train_batches and int(max_train_batches) > 0:
+		steps_per_epoch = int(min(int(max_train_batches), int(steps_per_epoch))) if steps_per_epoch > 0 else int(max_train_batches)
+	if steps_per_epoch <= 0:
+		raise RuntimeError("Could not infer steps_per_epoch from train_loader; required for planned_total_epochs override.")
+
+	# If the initial run trained only 1 epoch, total_steps was 1*steps_per_epoch and LR decayed to 0.
+	# Allow overriding to the intended full training horizon.
+	if int(args_cli.planned_total_epochs) and int(args_cli.planned_total_epochs) > 0 and sched_kind == "linear":
+		wr = float(warmup_steps) / float(max(1, total_steps))
+		total_steps = int(max(1, int(args_cli.planned_total_epochs) * int(steps_per_epoch)))
+		warmup_steps = int(max(0, min(total_steps, int(round(wr * float(total_steps))))))
+		sched_d = dict(sched_d)
+		sched_d["kind"] = "linear"
+		sched_d["total_steps"] = int(total_steps)
+		sched_d["warmup_steps"] = int(warmup_steps)
+		payload["scheduler"] = dict(sched_d)
+
+	base_lr = float(ckpt_args["lr"])
+	lr0 = _lr_for_next_optimizer_step(
+		base_lr=base_lr,
+		global_step=int(global_step),
+		sched_kind=str(sched_kind),
+		warmup_steps=int(warmup_steps),
+		total_steps=int(total_steps),
+	)
+	_set_optimizer_lr(opt, lr0)
+	print(
+		f"[ResumeOneEpoch] start epoch={next_epoch} global_step={global_step} lr={lr0} "
+		f"sched={sched_kind} warmup_steps={warmup_steps} total_steps={total_steps} steps_per_epoch={steps_per_epoch}"
+	)
 
 	# Match tools/run_experiment.py: optionally schedule heavy computations by epoch.
 	dim2_on = _schedule(next_epoch, base=bool(ckpt_args.get("build_triangles", False)), every=int(ckpt_args.get("dim2_every", 0) or 0))
@@ -474,12 +543,15 @@ def main() -> None:
 			torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
 			opt.step()
 			global_step += 1
-			if lr_sched is not None:
-				lr_sched.step()
-			try:
-				lr_now = float(opt.param_groups[0].get("lr", float("nan")))
-			except Exception:
-				lr_now = float("nan")
+			# Update LR for the next step (matches run_experiment: scheduler.step() after optimizer.step()).
+			lr_now = _lr_for_next_optimizer_step(
+				base_lr=base_lr,
+				global_step=int(global_step),
+				sched_kind=str(sched_kind),
+				warmup_steps=int(warmup_steps),
+				total_steps=int(total_steps),
+			)
+			_set_optimizer_lr(opt, lr_now)
 			train_it.set_postfix(loss=float(loss.detach().item()), lr=lr_now, step=int(global_step))
 			attn = batch.get("attention_mask", None)
 			monitor.collect("train", attention_mask=attn)
@@ -544,8 +616,6 @@ def main() -> None:
 		"optimizer": opt.state_dict(),
 		"payload": dict(payload),
 	}
-	if lr_sched is not None:
-		last_obj["lr_scheduler"] = lr_sched.state_dict()
 	torch.save(last_obj, ckpt_path)
 
 	# Update best checkpoint if improved.
