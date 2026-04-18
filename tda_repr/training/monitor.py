@@ -363,36 +363,40 @@ def _gudhi_rips_summaries(X: np.ndarray, max_dim: int, max_edge_length: float) -
 	return out
 
 
-def _knn_edges(X: np.ndarray, k: int, pdist_device: str = "cpu") -> List[Tuple[int, int]]:
+def _pairwise_distances(X: np.ndarray, pdist_device: str = "cpu") -> np.ndarray:
 	"""
-	Build undirected kNN graph edges from point cloud X (N,D).
+	Compute pairwise distances D[i,j] for X (N,D) as a NumPy array.
 	Optional GPU distance via torch.cdist when pdist_device starts with 'cuda'.
 	"""
-	N = X.shape[0]
-	if N <= 1 or k <= 0:
-		return []
-	k = min(k, N - 1)
-
-	# distances
 	use_cuda = bool(isinstance(pdist_device, str) and pdist_device.startswith("cuda") and torch.cuda.is_available())
-
 	if use_cuda:
 		with torch.no_grad():
-			t = torch.from_numpy(X.astype(np.float32, copy=False)).to(pdist_device)
-			D = torch.cdist(t, t).cpu().numpy()
-	else:
-		# NumPy distances (O(N^2) but ok for small N)
-		a_sq = np.sum(X * X, axis=1, keepdims=True)
-		D2 = np.maximum(a_sq + a_sq.T - 2.0 * (X @ X.T), 0.0)
-		D = np.sqrt(D2)
+			t = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(pdist_device)
+			D = torch.cdist(t, t).to("cpu").numpy()
+		return np.asarray(D, dtype=np.float32)
+	# NumPy distances (O(N^2) but ok for N<=256/512 monitoring)
+	X = np.asarray(X, dtype=np.float32)
+	a_sq = np.sum(X * X, axis=1, keepdims=True)
+	D2 = np.maximum(a_sq + a_sq.T - 2.0 * (X @ X.T), 0.0)
+	return np.sqrt(D2).astype(np.float32, copy=False)
 
-	# build edges
+
+def _knn_edges_from_distance(D: np.ndarray, k: int) -> List[Tuple[int, int]]:
+	"""
+	Build undirected kNN graph edges from a precomputed distance matrix D (N,N).
+	"""
+	D = np.asarray(D)
+	if D.ndim != 2 or D.shape[0] != D.shape[1]:
+		raise ValueError("Expected square distance matrix D (N,N).")
+	N = int(D.shape[0])
+	if N <= 1 or k <= 0:
+		return []
+	k = min(int(k), N - 1)
+
 	edges: set[Tuple[int, int]] = set()
 	for i in range(N):
-		# Exclude self by setting to +inf
-		row = D[i].copy()
+		row = np.array(D[i], copy=True)
 		row[i] = np.inf
-		# partial select k nearest
 		neigh = np.argpartition(row, kth=k - 1)[:k]
 		for j in neigh:
 			a, b = (i, int(j))
@@ -404,11 +408,29 @@ def _knn_edges(X: np.ndarray, k: int, pdist_device: str = "cpu") -> List[Tuple[i
 	return sorted(edges)
 
 
+def _knn_edges(X: np.ndarray, k: int, pdist_device: str = "cpu") -> List[Tuple[int, int]]:
+	"""
+	Build undirected kNN graph edges from point cloud X (N,D).
+	Optional GPU distance via torch.cdist when pdist_device starts with 'cuda'.
+	"""
+	N = int(X.shape[0])
+	if N <= 1 or k <= 0:
+		return []
+	D = _pairwise_distances(X, pdist_device=pdist_device)
+	return _knn_edges_from_distance(D, k=int(k))
+
+
 def _build_knn_complex(X: np.ndarray, k: int, pdist_device: str = "cpu"):
 	N = X.shape[0]
 	verts = [(i,) for i in range(N)]
 	edges = _knn_edges(X, k=k, pdist_device=pdist_device)
 	simplices: List[Tuple[int, ...]] = verts + edges
+	return SimplicialComplex(simplices, closure=True)
+
+
+def _build_knn_complex_from_edges(N: int, edges: List[Tuple[int, int]]) -> SimplicialComplex:
+	verts = [(i,) for i in range(int(N))]
+	simplices: List[Tuple[int, ...]] = verts + [(int(a), int(b)) for a, b in edges]
 	return SimplicialComplex(simplices, closure=True)
 
 
@@ -463,6 +485,51 @@ def _build_knn_clique_complex_2(
 			break
 
 	simplices: List[Tuple[int, ...]] = verts + edges + triangles
+	return SimplicialComplex(simplices, closure=True)
+
+
+def _build_knn_clique_complex_2_from_edges(
+	N: int,
+	edges: List[Tuple[int, int]],
+	max_triangles: int = 50000,
+) -> SimplicialComplex:
+	N = int(N)
+	verts = [(i,) for i in range(N)]
+	edges2 = [(int(a), int(b)) for a, b in edges]
+	edge_set = set((a, b) if a < b else (b, a) for a, b in edges2 if a != b)
+
+	adj: List[List[int]] = [[] for _ in range(N)]
+	for a, b in edge_set:
+		adj[a].append(b)
+		adj[b].append(a)
+	for i in range(N):
+		adj[i].sort()
+
+	triangles: List[Tuple[int, int, int]] = []
+	cap = int(max_triangles)
+	for i in range(N):
+		ni = adj[i]
+		ln = len(ni)
+		if ln < 2:
+			continue
+		for u in range(ln):
+			j = ni[u]
+			if j <= i:
+				continue
+			for v in range(u + 1, ln):
+				k = ni[v]
+				if k <= j:
+					continue
+				if (j, k) in edge_set:
+					triangles.append((i, j, k))
+					if cap > 0 and len(triangles) >= cap:
+						break
+			if cap > 0 and len(triangles) >= cap:
+				break
+		if cap > 0 and len(triangles) >= cap:
+			break
+
+	simplices: List[Tuple[int, ...]] = verts + list(edge_set) + triangles
 	return SimplicialComplex(simplices, closure=True)
 
 
@@ -736,24 +803,23 @@ class RepresentationMonitor:
 								layer_out.update({f"gudhi_h{d}_{k}": float(v) for k, v in pi.items()})
 					except Exception as e:
 						layer_out["gudhi_error"] = str(e)
-				edges_K = _knn_edges(Xg, k=self.cfg.knn_k_small, pdist_device=self.cfg.mtopdiv_pdist_device)
-				edges_L = _knn_edges(Xg, k=self.cfg.knn_k_large, pdist_device=self.cfg.mtopdiv_pdist_device)
+				D = _pairwise_distances(Xg, pdist_device=self.cfg.mtopdiv_pdist_device)
+				edges_K = _knn_edges_from_distance(D, k=self.cfg.knn_k_small)
+				edges_L = _knn_edges_from_distance(D, k=self.cfg.knn_k_large)
 				if self.cfg.build_triangles:
-					K = _build_knn_clique_complex_2(
-						Xg,
-						k=self.cfg.knn_k_small,
-						pdist_device=self.cfg.mtopdiv_pdist_device,
+					K = _build_knn_clique_complex_2_from_edges(
+						N=int(Xg.shape[0]),
+						edges=edges_K,
 						max_triangles=self.cfg.max_triangles,
 					)
-					L = _build_knn_clique_complex_2(
-						Xg,
-						k=self.cfg.knn_k_large,
-						pdist_device=self.cfg.mtopdiv_pdist_device,
+					L = _build_knn_clique_complex_2_from_edges(
+						N=int(Xg.shape[0]),
+						edges=edges_L,
 						max_triangles=self.cfg.max_triangles,
 					)
 				else:
-					K = _build_knn_complex(Xg, k=self.cfg.knn_k_small, pdist_device=self.cfg.mtopdiv_pdist_device)
-					L = _build_knn_complex(Xg, k=self.cfg.knn_k_large, pdist_device=self.cfg.mtopdiv_pdist_device)
+					K = _build_knn_complex_from_edges(int(Xg.shape[0]), edges_K)
+					L = _build_knn_complex_from_edges(int(Xg.shape[0]), edges_L)
 				layer_time["build_knn_complex"] = time.perf_counter() - t0
 
 				# Hodge on L (graph at larger scale)
