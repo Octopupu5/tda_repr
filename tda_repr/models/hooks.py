@@ -43,9 +43,51 @@ class LayerTaps:
 		return False
 
 	def _register(self) -> None:
+		def _reduce_hook_value(mod: nn.Module, inp: Tuple[torch.Tensor, ...], out: Any) -> Any:
+			"""
+			Keep hook payload small/stable.
+
+			Some transformer blocks return tuples that may include caches (e.g. KV), which can be very large.
+			We keep only the primary tensor (hidden states / logits). For very wide Linear heads (e.g. LM vocab
+			projection), we prefer the input activations to avoid exploding the monitored dimensionality.
+			"""
+			# Prefer the input activations for extremely wide linear projections (e.g. lm_head).
+			if isinstance(mod, nn.Linear) and isinstance(out, torch.Tensor):
+				try:
+					if int(out.shape[-1]) >= 8192 and isinstance(inp, tuple) and inp and isinstance(inp[0], torch.Tensor):
+						return inp[0]
+				except Exception:
+					pass
+
+			# Common: module returns (hidden_states, *extras)
+			if isinstance(out, (tuple, list)) and out:
+				return out[0]
+
+			# HF ModelOutput-like or mapping-like payloads
+			if hasattr(out, "to_tuple") and callable(getattr(out, "to_tuple")):
+				try:
+					tup = out.to_tuple()
+					if isinstance(tup, (tuple, list)) and tup:
+						return tup[0]
+				except Exception:
+					pass
+			if isinstance(out, dict) or (hasattr(out, "keys") and hasattr(out, "__getitem__")):
+				try:
+					keys = list(out.keys())  # type: ignore[attr-defined]
+				except Exception:
+					keys = []
+				for key in ("last_hidden_state", "logits", "hidden_states"):
+					if key in keys:
+						try:
+							return out[key]  # type: ignore[index]
+						except Exception:
+							break
+
+			return out
+
 		def make_hook(k: str):
-			def hook(_module: nn.Module, _inp: Tuple[torch.Tensor, ...], out: Any):
-				self.outputs[k] = out
+			def hook(module: nn.Module, inp: Tuple[torch.Tensor, ...], out: Any):
+				self.outputs[k] = _reduce_hook_value(module, inp, out)
 			return hook
 		for name, mod in self.modules.items():
 			self._handles.append(mod.register_forward_hook(make_hook(name)))

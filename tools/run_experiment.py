@@ -2179,6 +2179,13 @@ def main():
 					cfg = AutoConfig.from_pretrained(model_id)
 					model = AutoModelForCausalLM.from_config(cfg)
 				model.to(device)
+				# Training does not benefit from KV caching; disabling it prevents extra allocations
+				# and makes layer hooks cheaper/stable.
+				try:
+					if hasattr(model, "config") and getattr(model, "config", None) is not None:
+						model.config.use_cache = False
+				except Exception as e:
+					raise RuntimeError("Failed to set model.config.use_cache=False for generation training.") from e
 				# Avoid repeated transformers warnings during open-end generation:
 				# set pad_token_id once on the model/generation config.
 				if nlp_tokenizer is not None:

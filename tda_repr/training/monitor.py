@@ -619,6 +619,9 @@ class RepresentationMonitor:
 			X = X[:remain]
 			self._buf[stage].setdefault(name, []).append(X)
 			self._n[stage][name] = n_layer + int(X.shape[0])
+		# Drop references to the most recent forward outputs to avoid holding large tensors
+		# (and any attached autograd graph / model caches) longer than necessary.
+		self._taps.clear()
 
 	def _stack(self, stage: str, layer: str) -> Optional[np.ndarray]:
 		chunks = self._buf.get(stage, {}).get(layer, [])
