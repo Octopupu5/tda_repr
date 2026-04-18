@@ -142,7 +142,7 @@ def _repr_from_tensor(t: Any, attention_mask: Optional[torch.Tensor] = None, seq
 	"""
 	Convert common activation shapes into (N, D) point cloud.
 	- (N, C, H, W) -> global avg pool -> (N, C)
-	- (N, T, D) -> take first token -> (N, D)
+	- (N, T, D) -> pool over tokens -> (N, D)
 	- (N, D) -> (N, D)
 	- otherwise -> flatten to (N, -1)
 	"""
@@ -152,10 +152,9 @@ def _repr_from_tensor(t: Any, attention_mask: Optional[torch.Tensor] = None, seq
 
 	with torch.no_grad():
 		x = t.detach()
-		# numpy() cannot handle bfloat16 tensors; also keep monitoring stable in fp16.
+		# Avoid casting large 3D activations to float32 before pooling: it is expensive and can
+		# cause big transient allocations for long sequences. We cast AFTER pooling instead.
 		if x.is_floating_point() is False:
-			x = x.float()
-		elif x.dtype in (torch.bfloat16, torch.float16):
 			x = x.float()
 		# (N,C,H,W)
 		if x.dim() == 4:
@@ -165,11 +164,25 @@ def _repr_from_tensor(t: Any, attention_mask: Optional[torch.Tensor] = None, seq
 			mode = str(seq_pooling).lower().strip() or "first_token"
 			if mode == "first_token":
 				x = x[:, 0, :]
+			elif mode == "last_token":
+				# Prefer last non-pad token when attention_mask is provided (works with left padding).
+				if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 2:
+					m = attention_mask.to(device=x.device)
+					if m.shape[0] == x.shape[0] and m.shape[1] == x.shape[1]:
+						idx = m.sum(dim=1).to(dtype=torch.long) - 1
+						idx = idx.clamp_min(0)
+						rows = torch.arange(x.shape[0], device=x.device, dtype=torch.long)
+						x = x[rows, idx, :]
+					else:
+						x = x[:, -1, :]
+				else:
+					x = x[:, -1, :]
 			elif mode == "mean_masked":
 				if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 2:
 					m = attention_mask.to(device=x.device)
 					if m.shape[0] == x.shape[0] and m.shape[1] == x.shape[1]:
-						mf = m.unsqueeze(-1).float()
+						# Keep mask in the same dtype as x to avoid upcasting x to float32.
+						mf = m.unsqueeze(-1).to(dtype=x.dtype)
 						x = (x * mf).sum(dim=1) / mf.sum(dim=1).clamp_min(1.0)
 					else:
 						x = x.mean(dim=1)
@@ -184,6 +197,9 @@ def _repr_from_tensor(t: Any, attention_mask: Optional[torch.Tensor] = None, seq
 		else:
 			x = x.view(x.shape[0], -1)
 
+		# numpy() cannot handle bfloat16, and we want stable downstream numeric behavior.
+		if x.dtype in (torch.bfloat16, torch.float16):
+			x = x.float()
 		return x.cpu().numpy().astype(np.float32, copy=False)
 
 

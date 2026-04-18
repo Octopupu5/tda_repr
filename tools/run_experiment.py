@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import sys
 import time
@@ -527,6 +528,15 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 					step -= 1
 					continue
 				args.nlp_gen_max_target_len = int(v3)
+				v4 = _ask_int(
+					"NLP generation: token budget per batch (0=disable; helps stabilize speed/OOM)",
+					int(getattr(args, "nlp_gen_token_budget", 0)),
+					step,
+				)
+				if v4 == BACK:
+					step -= 1
+					continue
+				args.nlp_gen_token_budget = int(v4)
 			step += 1
 			continue
 
@@ -855,6 +865,103 @@ class LengthGroupedBatchSampler(Sampler[List[int]]):
 		for j in order:
 			yield list(self._batches[j])
 
+
+class TokenBudgetBatchSampler(Sampler[List[int]]):
+	"""
+	Batch examples so that total tokens per batch stay bounded.
+
+	This stabilizes step time and reduces OOM risk when sequence lengths vary a lot.
+	"""
+
+	def __init__(
+		self,
+		lengths: Sequence[int],
+		max_tokens: int,
+		max_batch_size: int,
+		*,
+		shuffle_batches: bool = True,
+		seed: int = 0,
+		drop_last: bool = False,
+	) -> None:
+		if int(max_tokens) <= 0:
+			raise ValueError("max_tokens must be positive.")
+		if int(max_batch_size) <= 0:
+			raise ValueError("max_batch_size must be positive.")
+		self.lengths = [max(1, int(x)) for x in lengths]
+		self.max_tokens = int(max_tokens)
+		self.max_batch_size = int(max_batch_size)
+		self.shuffle_batches = bool(shuffle_batches)
+		self.seed = int(seed)
+		self.drop_last = bool(drop_last)
+		self.epoch = 0
+
+		n = len(self.lengths)
+		order = sorted(range(n), key=lambda i: self.lengths[i])
+		batches: List[List[int]] = []
+		cur: List[int] = []
+		cur_tok = 0
+		for idx in order:
+			l = int(self.lengths[idx])
+			# If a single sample exceeds budget, still yield it alone.
+			if not cur:
+				cur = [idx]
+				cur_tok = l
+				if l > self.max_tokens:
+					batches.append(cur)
+					cur, cur_tok = [], 0
+				continue
+			# Close batch if adding idx would exceed constraints.
+			if (len(cur) >= self.max_batch_size) or (cur_tok + l > self.max_tokens):
+				batches.append(cur)
+				cur = [idx]
+				cur_tok = l
+				if l > self.max_tokens:
+					batches.append(cur)
+					cur, cur_tok = [], 0
+			else:
+				cur.append(idx)
+				cur_tok += l
+		if cur and not self.drop_last:
+			batches.append(cur)
+		self._batches = batches if batches else [order]
+
+	def set_epoch(self, epoch: int) -> None:
+		self.epoch = int(epoch)
+
+	def __len__(self) -> int:
+		return len(self._batches)
+
+	def __iter__(self) -> Iterable[List[int]]:
+		g = torch.Generator()
+		g.manual_seed(self.seed + self.epoch)
+		order = list(range(len(self._batches)))
+		if self.shuffle_batches:
+			perm = torch.randperm(len(order), generator=g).tolist()
+			order = [order[i] for i in perm]
+		for j in order:
+			yield list(self._batches[j])
+
+
+def _maybe_empty_cache(device: str) -> None:
+	"""
+	Best-effort memory defragmentation between epochs.
+	Useful on MPS/unified memory and sometimes helps CUDA fragmentation.
+	"""
+	try:
+		gc.collect()
+	except Exception:
+		pass
+	dev = str(device).lower().strip()
+	if dev.startswith("cuda"):
+		try:
+			torch.cuda.empty_cache()
+		except Exception:
+			pass
+	elif dev == "mps":
+		try:
+			torch.mps.empty_cache()  # type: ignore[attr-defined]
+		except Exception:
+			pass
 
 def _rewrite_progress_figures(
 	run_dir: str,
@@ -1716,6 +1823,12 @@ def main():
 	# NLP generation batching (SmolLM)
 	ap.add_argument("--nlp_gen_max_len", type=int, default=512, help="Max total tokens (prompt+target+eos) for generation batching.")
 	ap.add_argument("--nlp_gen_max_target_len", type=int, default=96, help="Max target tokens for generation batching (assistant).")
+	ap.add_argument(
+		"--nlp_gen_token_budget",
+		type=int,
+		default=0,
+		help="If >0, use token-budget batching for generation training: sum(token_lengths) per batch <= budget (batch size becomes variable).",
+	)
 	ap.add_argument("--nlp_gen_log_token_lens", action="store_true", help="Log token length stats (max/p95/p99) for prompt/target/total.")
 	ap.add_argument("--nlp_gen_scan_token_lens", action="store_true", help="Scan the selected dataset subset and print token length stats before training.")
 	ap.add_argument("--nlp_gen_scan_token_lens_only", action="store_true", help="If set, run the token length scan and exit before training.")
@@ -2339,41 +2452,60 @@ def main():
 				return out
 
 			bundle.collate_fn = _qa_gen_collate
-		train_batch_sampler: Optional[LengthGroupedBatchSampler] = None
+		train_epoch_sampler: Optional[Any] = None
 		loaders = make_dataloaders(bundle, batch_size=args.batch_size, num_workers=0)
 		train_loader = loaders["train"]
 		val_loader = loaders["val"] or loaders["test"]
 		if train_loader is None or val_loader is None:
 			raise RuntimeError("Dataset did not provide required splits.")
-		if (
-			str(args.task).lower().strip() == "nlp"
-			and nlp_objective == "generation"
-			and bool(getattr(args, "nlp_gen_length_grouping", True))
-			and bundle.train is not None
-			and bundle.collate_fn is not None
-		):
+		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and bundle.train is not None and bundle.collate_fn is not None:
 			try:
 				if nlp_tokenizer is None:
-					raise RuntimeError("Tokenizer is required for length-grouped NLP generation training.")
+					raise RuntimeError("Tokenizer is required for generation batching.")
 				lens = _precompute_generation_total_lengths(bundle.train, nlp_tokenizer)
-				train_batch_sampler = LengthGroupedBatchSampler(
-					lens,
-					int(args.batch_size),
-					shuffle_batches=True,
-					seed=int(args.seed),
-					drop_last=False,
-				)
-				train_loader = DataLoader(
-					bundle.train,
-					batch_sampler=train_batch_sampler,
-					num_workers=0,
-					collate_fn=bundle.collate_fn,
-				)
-				loaders["train"] = train_loader
-				print(f"[NLP] Length-grouped training: batches_per_epoch={len(train_batch_sampler)} batch_size_cap={int(args.batch_size)}")
+				token_budget = int(getattr(args, "nlp_gen_token_budget", 0) or 0)
+				if token_budget > 0:
+					train_epoch_sampler = TokenBudgetBatchSampler(
+						lens,
+						max_tokens=token_budget,
+						max_batch_size=int(args.batch_size),
+						shuffle_batches=True,
+						seed=int(args.seed),
+						drop_last=False,
+					)
+					train_loader = DataLoader(
+						bundle.train,
+						batch_sampler=train_epoch_sampler,
+						num_workers=0,
+						collate_fn=bundle.collate_fn,
+					)
+					loaders["train"] = train_loader
+					print(
+						f"[NLP] Token-budget training: batches_per_epoch={len(train_epoch_sampler)} "
+						f"max_tokens={token_budget} max_batch_size_cap={int(args.batch_size)}"
+					)
+				elif bool(getattr(args, "nlp_gen_length_grouping", True)):
+					train_epoch_sampler = LengthGroupedBatchSampler(
+						lens,
+						int(args.batch_size),
+						shuffle_batches=True,
+						seed=int(args.seed),
+						drop_last=False,
+					)
+					train_loader = DataLoader(
+						bundle.train,
+						batch_sampler=train_epoch_sampler,
+						num_workers=0,
+						collate_fn=bundle.collate_fn,
+					)
+					loaders["train"] = train_loader
+					print(
+						f"[NLP] Length-grouped training: batches_per_epoch={len(train_epoch_sampler)} "
+						f"batch_size_cap={int(args.batch_size)}"
+					)
 			except Exception as e:
-				print("[NLP] Length grouping disabled:", e)
-				train_batch_sampler = None
+				print("[NLP] Custom batching disabled:", e)
+				train_epoch_sampler = None
 
 		num_classes = _infer_num_classes(bundle.train) if bundle.train is not None else _infer_num_classes(bundle.val or bundle.test)
 
@@ -2620,7 +2752,9 @@ def main():
 		monitor_cfg = RepresentationMonitorConfig(
 			layer_names=layer_names,
 			max_samples_per_stage=args.max_samples_per_stage,
-			seq_pooling=("mean_masked" if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation") else "first_token"),
+			# For causal LMs, pooling the last non-pad token is both meaningful and much cheaper
+			# than a masked mean over long sequences.
+			seq_pooling=("last_token" if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation") else "first_token"),
 			max_points_for_graph=args.max_points_for_graph,
 			max_points_for_mtopdiv=max(100, min(800, args.max_points_for_graph * 3)),
 			max_eigs=args.max_eigs,
@@ -2880,11 +3014,11 @@ def main():
 		for epoch in range(int(args.epochs)):
 			t_epoch0 = time.perf_counter()
 			monitor.reset_epoch()
-			if train_batch_sampler is not None:
+			if train_epoch_sampler is not None and hasattr(train_epoch_sampler, "set_epoch"):
 				try:
-					train_batch_sampler.set_epoch(int(epoch))
+					train_epoch_sampler.set_epoch(int(epoch))
 				except Exception as e:
-					print("[NLP] train_batch_sampler.set_epoch failed:", e)
+					print("[NLP] train_epoch_sampler.set_epoch failed:", e)
 
 			# Schedule heavy dim=2 / q=1 computations (affects end_epoch only)
 			dim2_on = _schedule(epoch, base=args.build_triangles, every=args.dim2_every)
@@ -3266,6 +3400,8 @@ def main():
 					early_stop_key=early_stop_key,
 					early_stop_signal_epoch=early_signal_epoch,
 				)
+			# Try to keep memory stable across epochs (helps MPS/unified memory; sometimes CUDA fragmentation).
+			_maybe_empty_cache(str(args.device))
 
 		store.log(
 			"train_done",
