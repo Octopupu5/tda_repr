@@ -886,6 +886,35 @@ def _save_model_checkpoint(path: str, model: nn.Module, epoch: int, payload: Dic
 	torch.save(obj, path)
 
 
+def _save_train_state_checkpoint(
+	path: str,
+	*,
+	model: nn.Module,
+	optimizer: torch.optim.Optimizer,
+	lr_scheduler: Optional[Any],
+	epoch: int,
+	global_step: int,
+	payload: Dict[str, Any],
+) -> None:
+	"""
+	Save a resumable training checkpoint (model + optimizer + scheduler).
+	"""
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	obj: Dict[str, Any] = {
+		"epoch": int(epoch),
+		"global_step": int(global_step),
+		"state_dict": model.state_dict(),
+		"optimizer": optimizer.state_dict(),
+		"payload": dict(payload or {}),
+	}
+	if lr_scheduler is not None:
+		try:
+			obj["lr_scheduler"] = lr_scheduler.state_dict()
+		except Exception as e:
+			raise RuntimeError("Failed to serialize lr_scheduler.state_dict() for checkpoint.") from e
+	torch.save(obj, path)
+
+
 def _collect_cv_embeddings(
 	model: nn.Module,
 	loader: Any,
@@ -1741,6 +1770,7 @@ def main():
 			except Exception as e:
 				raise RuntimeError("Failed to set tokenizer.padding_side='left' for generation objective.") from e
 		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name=tok_name)
+		smol_kept_pos: Optional[List[int]] = None
 		# SmolTalk summarize: choose subset size (cap 20k), then create train/val split.
 		# This uses args.nlp_max_train_examples as the TOTAL number of examples used before splitting.
 		if str(args.task).lower().strip() == "nlp" and str(args.dataset) == "smol-summarize":
@@ -1990,6 +2020,7 @@ def main():
 				)
 
 			base = base.select(kept_pos)
+			smol_kept_pos = list(int(x) for x in kept_pos)
 			print(
 				"[SmolSummarize] selected",
 				f"n={len(base)}",
@@ -2560,11 +2591,13 @@ def main():
 				"model_name_or_path": model_name_or_path,
 				"monitor": asdict(monitor_cfg),
 				"args": vars(args),
+				"smol_summarize_kept_pos": smol_kept_pos,
 			}
 		)
 		checkpoints_dir = os.path.join(store.run_dir, "checkpoints")
 		best_ckpt_path = os.path.join(checkpoints_dir, "model_best_main.pt")
 		early_ckpt_path = os.path.join(checkpoints_dir, "model_early_signal.pt")
+		last_ckpt_path = os.path.join(checkpoints_dir, "model_last.pt")
 		bench_specs: List[BenchmarkSpec] = []
 		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
 			bench_specs = [
@@ -2672,6 +2705,7 @@ def main():
 			raise ValueError(f"No trainable parameters for finetune mode '{finetune_mode}'.")
 		opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 		lr_sched = None
+		sched_info: Dict[str, Any] = {"kind": "none"}
 		if str(args.task).lower().strip() == "nlp" and str(getattr(args, "nlp_scheduler", "none")).lower().strip() == "linear":
 			# Linear warmup then linear decay to 0 (common HF fine-tune recipe).
 			try:
@@ -2692,6 +2726,7 @@ def main():
 				if warmup_steps <= 0:
 					warmup_steps = int(float(getattr(args, "nlp_warmup_ratio", 0.1)) * float(total_steps))
 				warmup_steps = max(0, min(int(warmup_steps), int(total_steps)))
+				sched_info = {"kind": "linear", "warmup_steps": int(warmup_steps), "total_steps": int(total_steps)}
 
 				def _lr_lambda(step: int) -> float:
 					if warmup_steps > 0 and step < warmup_steps:
@@ -2713,6 +2748,7 @@ def main():
 		# - for metrics to minimize (loss/ppl) we use negative values
 		# - for metrics to maximize (accuracy/f1/bleu) we use the raw value
 		best = {"metric": -float("inf"), "epoch": -1, "bench": "", "metric_name": ""}
+		global_step = 0
 		t0_total = time.perf_counter()
 		for epoch in range(int(args.epochs)):
 			t_epoch0 = time.perf_counter()
@@ -2819,6 +2855,7 @@ def main():
 						except Exception:
 							pass
 					opt.step()
+					global_step += 1
 					if lr_sched is not None:
 						try:
 							lr_sched.step()
@@ -2886,6 +2923,32 @@ def main():
 				loss_fn=loss_fn,
 				extra=extra,
 			)
+			# Save resumable state checkpoint for manual per-epoch continuation.
+			if bool(args.save_models):
+				_save_train_state_checkpoint(
+					last_ckpt_path,
+					model=model,
+					optimizer=opt,
+					lr_scheduler=lr_sched,
+					epoch=int(epoch),
+					global_step=int(global_step),
+					payload={
+						"kind": "last",
+						"task": str(args.task),
+						"dataset": str(args.dataset),
+						"model": str(args.model),
+						"model_name_or_path": str(model_name_or_path),
+						"nlp_objective": str(nlp_objective),
+						"finetune": str(finetune_mode),
+						"device": str(device),
+						"args": vars(args),
+						"monitor": asdict(monitor_cfg),
+						"monitor_layers": list(layer_names),
+						"bench_metrics": list(bench_metrics),
+						"scheduler": dict(sched_info),
+						"smol_summarize_kept_pos": smol_kept_pos,
+					},
+				)
 			# Release representation buffers early to keep memory stable across epochs.
 			monitor.reset_epoch()
 			_cleanup_memory(device=str(args.device))
@@ -3101,6 +3164,7 @@ def main():
 				"checkpoints": {
 					"best_main": (best_ckpt_path if os.path.exists(best_ckpt_path) else None),
 					"early_signal": (early_ckpt_path if os.path.exists(early_ckpt_path) else None),
+					"last": (last_ckpt_path if os.path.exists(last_ckpt_path) else None),
 				},
 			},
 		)
