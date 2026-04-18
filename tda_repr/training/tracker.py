@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import time
 from typing import Any, Dict, List, Optional
 
-from .benchmarks import BenchmarkSpec, evaluate_classification, evaluate_generation_bleu, evaluate_generation_loss_ppl
+from .benchmarks import BenchmarkSpec, evaluate_classification, evaluate_generation_bleu
 from .monitor import RepresentationMonitor
 from .results import RunStore
 
@@ -81,21 +81,13 @@ class ExperimentTracker:
 							max_batches=self.cfg.max_eval_batches,
 						)
 					elif kind == "generation":
-						want_bleu = (spec.metrics is None) or (not spec.metrics) or ("bleu" in set(spec.metrics))
-						if want_bleu:
-							metrics = evaluate_generation_bleu(
-								model,
-								loader,
-								tokenizer=spec.tokenizer,
-								max_batches=self.cfg.max_eval_batches,
-								generate_kwargs=spec.generate_kwargs,
-							)
-						else:
-							metrics = evaluate_generation_loss_ppl(
-								model,
-								loader,
-								max_batches=self.cfg.max_eval_batches,
-							)
+						metrics = evaluate_generation_bleu(
+							model,
+							loader,
+							tokenizer=spec.tokenizer,
+							max_batches=self.cfg.max_eval_batches,
+							generate_kwargs=spec.generate_kwargs,
+						)
 					else:
 						raise ValueError(f"Unknown BenchmarkSpec.kind: {spec.kind!r}")
 					# Keep only requested metrics (if present)

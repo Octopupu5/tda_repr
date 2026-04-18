@@ -1,16 +1,14 @@
 import argparse
-import gc
 import os
 import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Sampler
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from tqdm import tqdm
@@ -528,15 +526,6 @@ def _interactive_config_tui(args: argparse.Namespace) -> argparse.Namespace:
 					step -= 1
 					continue
 				args.nlp_gen_max_target_len = int(v3)
-				v4 = _ask_int(
-					"NLP generation: token budget per batch (0=disable; helps stabilize speed/OOM)",
-					int(getattr(args, "nlp_gen_token_budget", 0)),
-					step,
-				)
-				if v4 == BACK:
-					step -= 1
-					continue
-				args.nlp_gen_token_budget = int(v4)
 			step += 1
 			continue
 
@@ -706,268 +695,9 @@ def _series_value_at_epoch(series: List[Tuple[int, float]], epoch: int) -> Optio
 	return None
 
 
-def _nlp_extract_prompt_target_for_generation(ex: dict) -> Optional[Tuple[str, str]]:
-	"""
-	Match generation collate: SmolTalk-style messages or QA-style fields.
-	Returns (prompt, target) text before tokenization.
-	"""
-	if not isinstance(ex, dict):
-		return None
-
-	def _join_keys(keys: List[str]) -> str:
-		parts: List[str] = []
-		for k in keys:
-			v = ex.get(k, "")
-			s = str(v).strip()
-			if s:
-				parts.append(s)
-		return "\n\n".join(parts)
-
-	for k in ("messages", "conversation", "conversations"):
-		msgs = ex.get(k, None)
-		if not isinstance(msgs, list) or not msgs:
-			continue
-		if not isinstance(msgs[0], dict):
-			continue
-		if not ("role" in msgs[0] and "content" in msgs[0]):
-			continue
-		last_assistant = None
-		for i in range(len(msgs) - 1, -1, -1):
-			role = str((msgs[i] or {}).get("role", "")).lower().strip()
-			if role in ("assistant", "bot", "gpt"):
-				last_assistant = i
-				break
-		if last_assistant is None:
-			return None
-		target = str((msgs[last_assistant] or {}).get("content", "")).strip()
-		ctx = msgs[:last_assistant]
-		parts: List[str] = []
-		for m in ctx:
-			if not isinstance(m, dict):
-				continue
-			role = str(m.get("role", "")).strip().lower()
-			content = str(m.get("content", "")).strip()
-			if not content:
-				continue
-			if role == "system":
-				parts.append(f"System:\n{content}")
-			elif role == "user":
-				parts.append(f"User:\n{content}")
-			elif role == "assistant":
-				parts.append(f"Assistant:\n{content}")
-			else:
-				parts.append(f"{role.capitalize()}:\n{content}")
-		prompt = "\n\n".join(parts).strip()
-		if prompt:
-			prompt = prompt + "\n\nAssistant:\n"
-		else:
-			prompt = "Assistant:\n"
-		return prompt, target
-
-	q = _join_keys(["question_title", "question_content"])
-	a = _join_keys(["best_answer"])
-	if not q:
-		q = _join_keys(["question", "prompt", "text"])
-	if not a:
-		a = _join_keys(["answer", "target", "text"])
-	if not q or not a:
-		return None
-	return f"Question:\n{q}\n\nAnswer:\n", str(a)
-
-
-def _precompute_generation_total_lengths(dataset: Any, tokenizer: Any) -> List[int]:
-	"""Per-example total token length (prompt+target+EOS), aligned with dataset indices."""
-	if dataset is None:
-		raise ValueError("dataset is None")
-	try:
-		n = int(len(dataset))
-	except Exception as e:
-		raise RuntimeError("Training dataset must support len() for length grouping.") from e
-	eos = str(getattr(tokenizer, "eos_token", "") or "")
-	lengths = [8] * n
-	bs = 64
-	for start in range(0, n, bs):
-		end = min(n, start + bs)
-		texts: List[str] = []
-		for i in range(start, end):
-			ex = dataset[i]
-			if not isinstance(ex, dict):
-				raise TypeError(f"Dataset row {i} is not a dict.")
-			pt = _nlp_extract_prompt_target_for_generation(ex)
-			if pt is None:
-				raise ValueError(f"Could not infer prompt/target for dataset index {i} (keys={list(ex.keys())}).")
-			prompt, target = pt
-			if not str(target).strip():
-				raise ValueError(f"Empty generation target at dataset index {i}.")
-			texts.append(str(prompt) + str(target) + eos)
-		enc = tokenizer(
-			texts,
-			add_special_tokens=False,
-			padding=False,
-			truncation=False,
-		)
-		ids_list = enc.get("input_ids", None) if isinstance(enc, Mapping) else None
-		if not isinstance(ids_list, list):
-			raise RuntimeError("Tokenizer did not return batch input_ids for length precompute.")
-		for j, row_ids in enumerate(ids_list):
-			lengths[start + j] = max(1, int(len(row_ids)))
-	return lengths
-
-
-class LengthGroupedBatchSampler(Sampler[List[int]]):
-	"""
-	Groups examples with similar sequence lengths into batches (sorted by length, consecutive batches).
-	Shuffles batch order each epoch for training randomness without mixing very short and very long sequences.
-	"""
-
-	def __init__(
-		self,
-		lengths: Sequence[int],
-		batch_size: int,
-		*,
-		shuffle_batches: bool = True,
-		seed: int = 0,
-		drop_last: bool = False,
-	) -> None:
-		if batch_size <= 0:
-			raise ValueError("batch_size must be positive.")
-		self.lengths = list(int(x) for x in lengths)
-		self.batch_size = int(batch_size)
-		self.shuffle_batches = bool(shuffle_batches)
-		self.seed = int(seed)
-		self.drop_last = bool(drop_last)
-		self.epoch = 0
-		n = len(self.lengths)
-		order = sorted(range(n), key=lambda i: self.lengths[i])
-		batches: List[List[int]] = []
-		for i in range(0, n, self.batch_size):
-			chunk = order[i : i + self.batch_size]
-			if len(chunk) < self.batch_size and self.drop_last:
-				break
-			batches.append(chunk)
-		if not batches:
-			batches = [order]
-		self._batches = batches
-
-	def set_epoch(self, epoch: int) -> None:
-		self.epoch = int(epoch)
-
-	def __len__(self) -> int:
-		return len(self._batches)
-
-	def __iter__(self) -> Iterable[List[int]]:
-		g = torch.Generator()
-		g.manual_seed(self.seed + self.epoch)
-		order = list(range(len(self._batches)))
-		if self.shuffle_batches:
-			perm = torch.randperm(len(order), generator=g).tolist()
-			order = [order[i] for i in perm]
-		for j in order:
-			yield list(self._batches[j])
-
-
-class TokenBudgetBatchSampler(Sampler[List[int]]):
-	"""
-	Batch examples so that total tokens per batch stay bounded.
-
-	This stabilizes step time and reduces OOM risk when sequence lengths vary a lot.
-	"""
-
-	def __init__(
-		self,
-		lengths: Sequence[int],
-		max_tokens: int,
-		max_batch_size: int,
-		*,
-		shuffle_batches: bool = True,
-		seed: int = 0,
-		drop_last: bool = False,
-	) -> None:
-		if int(max_tokens) <= 0:
-			raise ValueError("max_tokens must be positive.")
-		if int(max_batch_size) <= 0:
-			raise ValueError("max_batch_size must be positive.")
-		self.lengths = [max(1, int(x)) for x in lengths]
-		self.max_tokens = int(max_tokens)
-		self.max_batch_size = int(max_batch_size)
-		self.shuffle_batches = bool(shuffle_batches)
-		self.seed = int(seed)
-		self.drop_last = bool(drop_last)
-		self.epoch = 0
-
-		n = len(self.lengths)
-		order = sorted(range(n), key=lambda i: self.lengths[i])
-		batches: List[List[int]] = []
-		cur: List[int] = []
-		cur_tok = 0
-		for idx in order:
-			l = int(self.lengths[idx])
-			# If a single sample exceeds budget, still yield it alone.
-			if not cur:
-				cur = [idx]
-				cur_tok = l
-				if l > self.max_tokens:
-					batches.append(cur)
-					cur, cur_tok = [], 0
-				continue
-			# Close batch if adding idx would exceed constraints.
-			if (len(cur) >= self.max_batch_size) or (cur_tok + l > self.max_tokens):
-				batches.append(cur)
-				cur = [idx]
-				cur_tok = l
-				if l > self.max_tokens:
-					batches.append(cur)
-					cur, cur_tok = [], 0
-			else:
-				cur.append(idx)
-				cur_tok += l
-		if cur and not self.drop_last:
-			batches.append(cur)
-		self._batches = batches if batches else [order]
-
-	def set_epoch(self, epoch: int) -> None:
-		self.epoch = int(epoch)
-
-	def __len__(self) -> int:
-		return len(self._batches)
-
-	def __iter__(self) -> Iterable[List[int]]:
-		g = torch.Generator()
-		g.manual_seed(self.seed + self.epoch)
-		order = list(range(len(self._batches)))
-		if self.shuffle_batches:
-			perm = torch.randperm(len(order), generator=g).tolist()
-			order = [order[i] for i in perm]
-		for j in order:
-			yield list(self._batches[j])
-
-
-def _maybe_empty_cache(device: str) -> None:
-	"""
-	Best-effort memory defragmentation between epochs.
-	Useful on MPS/unified memory and sometimes helps CUDA fragmentation.
-	"""
-	try:
-		gc.collect()
-	except Exception:
-		pass
-	dev = str(device).lower().strip()
-	if dev.startswith("cuda"):
-		try:
-			torch.cuda.empty_cache()
-		except Exception:
-			pass
-	elif dev == "mps":
-		try:
-			torch.mps.empty_cache()  # type: ignore[attr-defined]
-		except Exception:
-			pass
-
 def _rewrite_progress_figures(
 	run_dir: str,
 	dataset: str,
-	bench_metrics: Tuple[str, ...] = ("loss", "accuracy"),
-	nlp_objective: str = "classification",
 	early_stop_key: Optional[str] = None,
 	early_stop_signal_epoch: Optional[int] = None,
 ) -> None:
@@ -987,87 +717,63 @@ def _rewrite_progress_figures(
 	fig_dir = os.path.join(run_dir, "figures")
 	os.makedirs(fig_dir, exist_ok=True)
 
-	obj = str(nlp_objective).lower().strip()
-	bench_labels = {
-		"loss": "Validation loss",
-		"loss_assistant_only": "Validation loss (assistant-only)",
-		"ppl": "Validation perplexity",
-		"bleu": "Validation BLEU",
-		"accuracy": "Validation accuracy",
-		"f1_macro": "Validation F1 (macro)",
-		"precision_macro": "Validation precision (macro)",
-		"recall_macro": "Validation recall (macro)",
-	}
+	# Quality metrics progress (benchmark metrics). For generation, we plot the chosen
+	# generation metrics (e.g., ppl/loss_assistant_only) instead of accuracy/f1.
+	bench_prefix = f"bench.{dataset}-val."
+	all_scalar_keys = list_scalar_series_keys(recs)
+	val_metric_keys = [k for k in all_scalar_keys if k.startswith(bench_prefix)]
+	available_metrics = [k[len(bench_prefix) :] for k in val_metric_keys]
 
-	if obj == "generation":
-		series_list: List[Tuple[str, List[Tuple[int, float]]]] = []
-		for m in bench_metrics:
-			k = str(m).strip()
-			if not k:
-				continue
-			ser = get_series(recs, f"bench.{dataset}-val.{k}")
-			if ser:
-				series_list.append((bench_labels.get(k, f"Validation ({k})"), ser))
-		if not series_list:
-			for fb in ("loss_assistant_only", "loss", "ppl", "bleu"):
-				ser = get_series(recs, f"bench.{dataset}-val.{fb}")
-				if ser:
-					series_list.append((bench_labels.get(fb, fb), ser))
-					break
-		nplots = len(series_list)
-		if nplots > 0:
-			ncols = min(3, nplots)
-			nrows = int(np.ceil(nplots / float(ncols)))
-			fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.2 * nrows))
-			axes_arr = np.atleast_1d(axes).reshape(-1)
-			for ax_i, (title, ser) in enumerate(series_list):
-				ax = axes_arr[ax_i]
-				ax.set_title(title, fontsize=10)
-				ax.plot([e for e, _ in ser], [v for _, v in ser], marker="o")
-				if early_stop_signal_epoch is not None:
-					v = _series_value_at_epoch(ser, int(early_stop_signal_epoch))
-					if v is not None:
-						ax.scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-				ax.set_xlabel("epoch")
-				ax.grid(True, alpha=0.25, linestyle="--")
-			for ax in axes_arr[nplots:]:
-				ax.axis("off")
-			fig.tight_layout()
-			fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
-			plt.close(fig)
+	def _metric_title(m: str) -> str:
+		m = str(m)
+		if m == "f1_macro":
+			return "Validation F1 (macro)"
+		if m == "precision_macro":
+			return "Validation precision (macro)"
+		if m == "recall_macro":
+			return "Validation recall (macro)"
+		if m == "loss_assistant_only":
+			return "Validation loss (assistant-only)"
+		if m == "ppl":
+			return "Validation perplexity"
+		if m == "bleu":
+			return "Validation BLEU"
+		return f"Validation {m}"
+
+	is_generation_like = any(m in set(available_metrics) for m in ("ppl", "bleu", "loss_assistant_only"))
+	if is_generation_like:
+		priority = ["ppl", "loss_assistant_only", "loss", "bleu", "accuracy", "f1_macro", "precision_macro", "recall_macro"]
 	else:
-		s_acc = get_series(recs, f"bench.{dataset}-val.accuracy")
-		s_f1 = get_series(recs, f"bench.{dataset}-val.f1_macro")
-		s_loss = get_series(recs, f"bench.{dataset}-val.loss")
+		priority = ["accuracy", "f1_macro", "loss", "precision_macro", "recall_macro", "bleu", "ppl", "loss_assistant_only"]
 
-		fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.6))
-		axes[0].set_title("Validation accuracy")
-		axes[1].set_title("Validation F1 (macro)")
-		axes[2].set_title("Validation loss")
-		if s_acc:
-			axes[0].plot([e for e, _ in s_acc], [v for _, v in s_acc], marker="o")
+	selected: List[str] = []
+	for m in priority:
+		if m in set(available_metrics) and m not in selected:
+			selected.append(m)
+		if len(selected) >= 3:
+			break
+	if not selected:
+		# Nothing to plot.
+		return
+
+	n = len(selected)
+	fig, axes = plt.subplots(1, n, figsize=(4.4 * n, 3.6))
+	axes_arr = np.atleast_1d(axes).reshape(-1)
+	for ax_i, m in enumerate(selected):
+		ser = get_series(recs, f"{bench_prefix}{m}")
+		ax = axes_arr[ax_i]
+		ax.set_title(_metric_title(m))
+		if ser:
+			ax.plot([e for e, _ in ser], [v for _, v in ser], marker="o")
 			if early_stop_signal_epoch is not None:
-				v = _series_value_at_epoch(s_acc, int(early_stop_signal_epoch))
+				v = _series_value_at_epoch(ser, int(early_stop_signal_epoch))
 				if v is not None:
-					axes[0].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-		if s_f1:
-			axes[1].plot([e for e, _ in s_f1], [v for _, v in s_f1], marker="o")
-			if early_stop_signal_epoch is not None:
-				v = _series_value_at_epoch(s_f1, int(early_stop_signal_epoch))
-				if v is not None:
-					axes[1].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-		if s_loss:
-			axes[2].plot([e for e, _ in s_loss], [v for _, v in s_loss], marker="o")
-			if early_stop_signal_epoch is not None:
-				v = _series_value_at_epoch(s_loss, int(early_stop_signal_epoch))
-				if v is not None:
-					axes[2].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-		for ax in axes:
-			ax.set_xlabel("epoch")
-			ax.grid(True, alpha=0.25, linestyle="--")
-		fig.tight_layout()
-		fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
-		plt.close(fig)
+					ax.scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
+		ax.set_xlabel("epoch")
+		ax.grid(True, alpha=0.25, linestyle="--")
+	fig.tight_layout()
+	fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
+	plt.close(fig)
 
 	# Representation metrics progress (computed topo/spectral characteristics).
 	repr_keys_all = [k for k in list_scalar_series_keys(recs) if k.startswith("repr.layers.")]
@@ -1823,21 +1529,9 @@ def main():
 	# NLP generation batching (SmolLM)
 	ap.add_argument("--nlp_gen_max_len", type=int, default=512, help="Max total tokens (prompt+target+eos) for generation batching.")
 	ap.add_argument("--nlp_gen_max_target_len", type=int, default=96, help="Max target tokens for generation batching (assistant).")
-	ap.add_argument(
-		"--nlp_gen_token_budget",
-		type=int,
-		default=0,
-		help="If >0, use token-budget batching for generation training: sum(token_lengths) per batch <= budget (batch size becomes variable).",
-	)
 	ap.add_argument("--nlp_gen_log_token_lens", action="store_true", help="Log token length stats (max/p95/p99) for prompt/target/total.")
 	ap.add_argument("--nlp_gen_scan_token_lens", action="store_true", help="Scan the selected dataset subset and print token length stats before training.")
 	ap.add_argument("--nlp_gen_scan_token_lens_only", action="store_true", help="If set, run the token length scan and exit before training.")
-	ap.add_argument(
-		"--nlp_gen_length_grouping",
-		action=argparse.BooleanOptionalAction,
-		default=True,
-		help="Sort generation training examples by sequence length before batching (stabler tqdm ETA).",
-	)
 
 	# fine-tune strategies
 	ap.add_argument(
@@ -1999,20 +1693,19 @@ def main():
 			AutoTokenizer = getattr(tf, "AutoTokenizer")
 			nlp_tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
 			# Ensure padding token exists (Llama-like tokenizers often lack it).
-			try:
-				if getattr(nlp_tokenizer, "pad_token", None) is None:
-					eos = getattr(nlp_tokenizer, "eos_token", None)
-					if eos is not None:
-						nlp_tokenizer.pad_token = eos
-					else:
-						nlp_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-			except Exception:
-				pass
+			if getattr(nlp_tokenizer, "pad_token", None) is None:
+				eos = getattr(nlp_tokenizer, "eos_token", None)
+				if eos is not None:
+					nlp_tokenizer.pad_token = eos
+				else:
+					nlp_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+			if getattr(nlp_tokenizer, "pad_token_id", None) is None:
+				raise ValueError("Tokenizer is missing pad_token_id after pad token setup; cannot build padded batches.")
 			# Decoder-only generation is more reliable with left padding.
 			try:
 				nlp_tokenizer.padding_side = "left"
-			except Exception:
-				pass
+			except Exception as e:
+				raise RuntimeError("Failed to set tokenizer.padding_side='left' for generation objective.") from e
 		bundle = get_dataset(args.dataset, root=args.data_root, download=args.download, tokenizer_name=tok_name)
 		# SmolTalk summarize: choose subset size (cap 20k), then create train/val split.
 		# This uses args.nlp_max_train_examples as the TOTAL number of examples used before splitting.
@@ -2452,60 +2145,11 @@ def main():
 				return out
 
 			bundle.collate_fn = _qa_gen_collate
-		train_epoch_sampler: Optional[Any] = None
 		loaders = make_dataloaders(bundle, batch_size=args.batch_size, num_workers=0)
 		train_loader = loaders["train"]
 		val_loader = loaders["val"] or loaders["test"]
 		if train_loader is None or val_loader is None:
 			raise RuntimeError("Dataset did not provide required splits.")
-		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and bundle.train is not None and bundle.collate_fn is not None:
-			try:
-				if nlp_tokenizer is None:
-					raise RuntimeError("Tokenizer is required for generation batching.")
-				lens = _precompute_generation_total_lengths(bundle.train, nlp_tokenizer)
-				token_budget = int(getattr(args, "nlp_gen_token_budget", 0) or 0)
-				if token_budget > 0:
-					train_epoch_sampler = TokenBudgetBatchSampler(
-						lens,
-						max_tokens=token_budget,
-						max_batch_size=int(args.batch_size),
-						shuffle_batches=True,
-						seed=int(args.seed),
-						drop_last=False,
-					)
-					train_loader = DataLoader(
-						bundle.train,
-						batch_sampler=train_epoch_sampler,
-						num_workers=0,
-						collate_fn=bundle.collate_fn,
-					)
-					loaders["train"] = train_loader
-					print(
-						f"[NLP] Token-budget training: batches_per_epoch={len(train_epoch_sampler)} "
-						f"max_tokens={token_budget} max_batch_size_cap={int(args.batch_size)}"
-					)
-				elif bool(getattr(args, "nlp_gen_length_grouping", True)):
-					train_epoch_sampler = LengthGroupedBatchSampler(
-						lens,
-						int(args.batch_size),
-						shuffle_batches=True,
-						seed=int(args.seed),
-						drop_last=False,
-					)
-					train_loader = DataLoader(
-						bundle.train,
-						batch_sampler=train_epoch_sampler,
-						num_workers=0,
-						collate_fn=bundle.collate_fn,
-					)
-					loaders["train"] = train_loader
-					print(
-						f"[NLP] Length-grouped training: batches_per_epoch={len(train_epoch_sampler)} "
-						f"batch_size_cap={int(args.batch_size)}"
-					)
-			except Exception as e:
-				print("[NLP] Custom batching disabled:", e)
-				train_epoch_sampler = None
 
 		num_classes = _infer_num_classes(bundle.train) if bundle.train is not None else _infer_num_classes(bundle.val or bundle.test)
 
@@ -2535,19 +2179,37 @@ def main():
 					cfg = AutoConfig.from_pretrained(model_id)
 					model = AutoModelForCausalLM.from_config(cfg)
 				model.to(device)
-				try:
-					pad_tid = getattr(nlp_tokenizer, "pad_token_id", None)
-					if pad_tid is None:
-						pad_tid = getattr(nlp_tokenizer, "eos_token_id", None)
-					if pad_tid is not None:
-						mc = getattr(model, "config", None)
-						if mc is not None:
-							mc.pad_token_id = int(pad_tid)
-						gc = getattr(model, "generation_config", None)
-						if gc is not None:
-							gc.pad_token_id = int(pad_tid)
-				except Exception as e:
-					print("[Model] Failed to set pad_token_id on causal LM config:", e)
+				# Avoid repeated transformers warnings during open-end generation:
+				# set pad_token_id once on the model/generation config.
+				if nlp_tokenizer is not None:
+					pad_id = getattr(nlp_tokenizer, "pad_token_id", None)
+					if pad_id is None:
+						eos_id = getattr(nlp_tokenizer, "eos_token_id", None)
+						if isinstance(eos_id, (tuple, list)):
+							eos_id = eos_id[0] if eos_id else None
+						if eos_id is None:
+							raise ValueError("Tokenizer is missing eos_token_id; required for causal-LM generation.")
+						pad_id = int(eos_id)
+					try:
+						model.config.pad_token_id = int(pad_id)
+					except Exception as e:
+						raise RuntimeError("Failed to set model.config.pad_token_id for generation objective.") from e
+					if hasattr(model, "generation_config") and getattr(model, "generation_config", None) is not None:
+						try:
+							model.generation_config.pad_token_id = int(pad_id)
+						except Exception as e:
+							raise RuntimeError("Failed to set model.generation_config.pad_token_id for generation objective.") from e
+					# If a new PAD token was added to the tokenizer, align model embeddings.
+					try:
+						tok_len = int(len(nlp_tokenizer))
+						emb = model.get_input_embeddings()
+						if emb is not None and hasattr(emb, "weight") and hasattr(emb.weight, "shape"):
+							emb_n = int(emb.weight.shape[0])
+							if tok_len != emb_n:
+								model.resize_token_embeddings(tok_len)
+								model.to(device)
+					except Exception as e:
+						raise RuntimeError("Failed to resize model token embeddings after tokenizer special-tokens update.") from e
 				layer_names = _pick_transformer_blocks_generic_for_model(model)
 				loss_fn = None
 			else:
@@ -2752,9 +2414,7 @@ def main():
 		monitor_cfg = RepresentationMonitorConfig(
 			layer_names=layer_names,
 			max_samples_per_stage=args.max_samples_per_stage,
-			# For causal LMs, pooling the last non-pad token is both meaningful and much cheaper
-			# than a masked mean over long sequences.
-			seq_pooling=("last_token" if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation") else "first_token"),
+			seq_pooling=("mean_masked" if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation") else "first_token"),
 			max_points_for_graph=args.max_points_for_graph,
 			max_points_for_mtopdiv=max(100, min(800, args.max_points_for_graph * 3)),
 			max_eigs=args.max_eigs,
@@ -3008,17 +2668,11 @@ def main():
 		early_signal_epoch: Optional[int] = None
 		early_signal_main_metric: Optional[float] = None
 
-		# Use -inf so "maximize score" works for generation (-ppl / -loss are often < -1).
-		best = {"metric": float("-inf"), "epoch": -1, "bench": "", "metric_name": ""}
+		best = {"metric": -1.0, "epoch": -1, "bench": "", "metric_name": ""}
 		t0_total = time.perf_counter()
 		for epoch in range(int(args.epochs)):
 			t_epoch0 = time.perf_counter()
 			monitor.reset_epoch()
-			if train_epoch_sampler is not None and hasattr(train_epoch_sampler, "set_epoch"):
-				try:
-					train_epoch_sampler.set_epoch(int(epoch))
-				except Exception as e:
-					print("[NLP] train_epoch_sampler.set_epoch failed:", e)
 
 			# Schedule heavy dim=2 / q=1 computations (affects end_epoch only)
 			dim2_on = _schedule(epoch, base=args.build_triangles, every=args.dim2_every)
@@ -3251,12 +2905,7 @@ def main():
 					if should_stop and not early_signal_logged:
 						early_signal_logged = True
 						early_signal_epoch = int(epoch)
-						if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
-							early_signal_main_metric = float(
-								mm.get("loss_assistant_only", mm.get("loss", mm.get("ppl", -1.0))) or -1.0
-							)
-						else:
-							early_signal_main_metric = float(mm.get("f1_macro", mm.get("accuracy", -1.0)) or -1.0)
+						early_signal_main_metric = float(mm.get("f1_macro", mm.get("accuracy", -1.0)) or -1.0)
 						store.log(
 							"early_stop_signal",
 							{
@@ -3291,15 +2940,7 @@ def main():
 								payload={
 									"kind": "early_signal",
 									"main_metric": float(early_signal_main_metric),
-									"main_metric_name": (
-										"loss_assistant_only"
-										if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and "loss_assistant_only" in mm)
-										else (
-											"ppl"
-											if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and "ppl" in mm)
-											else ("f1_macro" if "f1_macro" in mm else "accuracy")
-										)
-									),
+									"main_metric_name": ("f1_macro" if "f1_macro" in mm else "accuracy"),
 									"task": str(args.task),
 									"dataset": str(args.dataset),
 									"model": str(args.model),
@@ -3320,11 +2961,9 @@ def main():
 							_rewrite_progress_figures(
 								store.run_dir,
 								dataset=str(args.dataset),
-								bench_metrics=bench_metrics,
-								nlp_objective=str(nlp_objective),
 								early_stop_key=early_stop_key,
 								early_stop_signal_epoch=early_signal_epoch,
-							)
+			)
 
 			# Extra eval on noisy val (CV)
 			if noisy_val_loader is not None:
@@ -3333,24 +2972,8 @@ def main():
 				m = evaluate_classification(model, noisy_val_loader, loss_fn=loss_fn, max_batches=(args.max_val_batches or None))
 				store.log("noisy_val", {"epoch": epoch, "sigma": float(args.cv_noise_sigma), "metrics": m})
 
-			# Track best: higher score is better (generation uses negative loss / negative ppl).
-			if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
-				if mm.get("ppl") is not None and np.isfinite(float(mm.get("ppl"))):
-					score = -float(mm["ppl"])
-					main_metric_name = "ppl"
-				elif mm.get("loss_assistant_only") is not None:
-					score = -float(mm["loss_assistant_only"])
-					main_metric_name = "loss_assistant_only"
-				elif mm.get("loss") is not None:
-					score = -float(mm["loss"])
-					main_metric_name = "loss"
-				elif mm.get("bleu") is not None:
-					score = float(mm["bleu"])
-					main_metric_name = "bleu"
-				else:
-					score = float("-inf")
-					main_metric_name = "none"
-			elif "f1_macro" in mm:
+			# Track best by f1_macro if available, else accuracy.
+			if "f1_macro" in mm:
 				score = float(mm.get("f1_macro", -1.0) or -1.0)
 				main_metric_name = "f1_macro"
 			elif "accuracy" in mm:
@@ -3395,13 +3018,9 @@ def main():
 				_rewrite_progress_figures(
 					store.run_dir,
 					dataset=str(args.dataset),
-					bench_metrics=bench_metrics,
-					nlp_objective=str(nlp_objective),
 					early_stop_key=early_stop_key,
 					early_stop_signal_epoch=early_signal_epoch,
 				)
-			# Try to keep memory stable across epochs (helps MPS/unified memory; sometimes CUDA fragmentation).
-			_maybe_empty_cache(str(args.device))
 
 		store.log(
 			"train_done",
