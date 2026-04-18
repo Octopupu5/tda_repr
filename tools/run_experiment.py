@@ -4,11 +4,12 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Sampler
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from tqdm import tqdm
@@ -695,9 +696,171 @@ def _series_value_at_epoch(series: List[Tuple[int, float]], epoch: int) -> Optio
 	return None
 
 
+def _nlp_extract_prompt_target_for_generation(ex: dict) -> Optional[Tuple[str, str]]:
+	"""
+	Match generation collate: SmolTalk-style messages or QA-style fields.
+	Returns (prompt, target) text before tokenization.
+	"""
+	if not isinstance(ex, dict):
+		return None
+
+	def _join_keys(keys: List[str]) -> str:
+		parts: List[str] = []
+		for k in keys:
+			v = ex.get(k, "")
+			s = str(v).strip()
+			if s:
+				parts.append(s)
+		return "\n\n".join(parts)
+
+	for k in ("messages", "conversation", "conversations"):
+		msgs = ex.get(k, None)
+		if not isinstance(msgs, list) or not msgs:
+			continue
+		if not isinstance(msgs[0], dict):
+			continue
+		if not ("role" in msgs[0] and "content" in msgs[0]):
+			continue
+		last_assistant = None
+		for i in range(len(msgs) - 1, -1, -1):
+			role = str((msgs[i] or {}).get("role", "")).lower().strip()
+			if role in ("assistant", "bot", "gpt"):
+				last_assistant = i
+				break
+		if last_assistant is None:
+			return None
+		target = str((msgs[last_assistant] or {}).get("content", "")).strip()
+		ctx = msgs[:last_assistant]
+		parts: List[str] = []
+		for m in ctx:
+			if not isinstance(m, dict):
+				continue
+			role = str(m.get("role", "")).strip().lower()
+			content = str(m.get("content", "")).strip()
+			if not content:
+				continue
+			if role == "system":
+				parts.append(f"System:\n{content}")
+			elif role == "user":
+				parts.append(f"User:\n{content}")
+			elif role == "assistant":
+				parts.append(f"Assistant:\n{content}")
+			else:
+				parts.append(f"{role.capitalize()}:\n{content}")
+		prompt = "\n\n".join(parts).strip()
+		if prompt:
+			prompt = prompt + "\n\nAssistant:\n"
+		else:
+			prompt = "Assistant:\n"
+		return prompt, target
+
+	q = _join_keys(["question_title", "question_content"])
+	a = _join_keys(["best_answer"])
+	if not q:
+		q = _join_keys(["question", "prompt", "text"])
+	if not a:
+		a = _join_keys(["answer", "target", "text"])
+	if not q or not a:
+		return None
+	return f"Question:\n{q}\n\nAnswer:\n", str(a)
+
+
+def _precompute_generation_total_lengths(dataset: Any, tokenizer: Any) -> List[int]:
+	"""Per-example total token length (prompt+target+EOS), aligned with dataset indices."""
+	if dataset is None:
+		raise ValueError("dataset is None")
+	try:
+		n = int(len(dataset))
+	except Exception as e:
+		raise RuntimeError("Training dataset must support len() for length grouping.") from e
+	eos = str(getattr(tokenizer, "eos_token", "") or "")
+	lengths = [8] * n
+	bs = 64
+	for start in range(0, n, bs):
+		end = min(n, start + bs)
+		texts: List[str] = []
+		for i in range(start, end):
+			ex = dataset[i]
+			if not isinstance(ex, dict):
+				raise TypeError(f"Dataset row {i} is not a dict.")
+			pt = _nlp_extract_prompt_target_for_generation(ex)
+			if pt is None:
+				raise ValueError(f"Could not infer prompt/target for dataset index {i} (keys={list(ex.keys())}).")
+			prompt, target = pt
+			if not str(target).strip():
+				raise ValueError(f"Empty generation target at dataset index {i}.")
+			texts.append(str(prompt) + str(target) + eos)
+		enc = tokenizer(
+			texts,
+			add_special_tokens=False,
+			padding=False,
+			truncation=False,
+		)
+		ids_list = enc.get("input_ids", None) if isinstance(enc, Mapping) else None
+		if not isinstance(ids_list, list):
+			raise RuntimeError("Tokenizer did not return batch input_ids for length precompute.")
+		for j, row_ids in enumerate(ids_list):
+			lengths[start + j] = max(1, int(len(row_ids)))
+	return lengths
+
+
+class LengthGroupedBatchSampler(Sampler[List[int]]):
+	"""
+	Groups examples with similar sequence lengths into batches (sorted by length, consecutive batches).
+	Shuffles batch order each epoch for training randomness without mixing very short and very long sequences.
+	"""
+
+	def __init__(
+		self,
+		lengths: Sequence[int],
+		batch_size: int,
+		*,
+		shuffle_batches: bool = True,
+		seed: int = 0,
+		drop_last: bool = False,
+	) -> None:
+		if batch_size <= 0:
+			raise ValueError("batch_size must be positive.")
+		self.lengths = list(int(x) for x in lengths)
+		self.batch_size = int(batch_size)
+		self.shuffle_batches = bool(shuffle_batches)
+		self.seed = int(seed)
+		self.drop_last = bool(drop_last)
+		self.epoch = 0
+		n = len(self.lengths)
+		order = sorted(range(n), key=lambda i: self.lengths[i])
+		batches: List[List[int]] = []
+		for i in range(0, n, self.batch_size):
+			chunk = order[i : i + self.batch_size]
+			if len(chunk) < self.batch_size and self.drop_last:
+				break
+			batches.append(chunk)
+		if not batches:
+			batches = [order]
+		self._batches = batches
+
+	def set_epoch(self, epoch: int) -> None:
+		self.epoch = int(epoch)
+
+	def __len__(self) -> int:
+		return len(self._batches)
+
+	def __iter__(self) -> Iterable[List[int]]:
+		g = torch.Generator()
+		g.manual_seed(self.seed + self.epoch)
+		order = list(range(len(self._batches)))
+		if self.shuffle_batches:
+			perm = torch.randperm(len(order), generator=g).tolist()
+			order = [order[i] for i in perm]
+		for j in order:
+			yield list(self._batches[j])
+
+
 def _rewrite_progress_figures(
 	run_dir: str,
 	dataset: str,
+	bench_metrics: Tuple[str, ...] = ("loss", "accuracy"),
+	nlp_objective: str = "classification",
 	early_stop_key: Optional[str] = None,
 	early_stop_signal_epoch: Optional[int] = None,
 ) -> None:
@@ -717,38 +880,87 @@ def _rewrite_progress_figures(
 	fig_dir = os.path.join(run_dir, "figures")
 	os.makedirs(fig_dir, exist_ok=True)
 
-	s_acc = get_series(recs, f"bench.{dataset}-val.accuracy")
-	s_f1 = get_series(recs, f"bench.{dataset}-val.f1_macro")
-	s_loss = get_series(recs, f"bench.{dataset}-val.loss")
+	obj = str(nlp_objective).lower().strip()
+	bench_labels = {
+		"loss": "Validation loss",
+		"loss_assistant_only": "Validation loss (assistant-only)",
+		"ppl": "Validation perplexity",
+		"bleu": "Validation BLEU",
+		"accuracy": "Validation accuracy",
+		"f1_macro": "Validation F1 (macro)",
+		"precision_macro": "Validation precision (macro)",
+		"recall_macro": "Validation recall (macro)",
+	}
 
-	fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.6))
-	axes[0].set_title("Validation accuracy")
-	axes[1].set_title("Validation F1 (macro)")
-	axes[2].set_title("Validation loss")
-	if s_acc:
-		axes[0].plot([e for e, _ in s_acc], [v for _, v in s_acc], marker="o")
-		if early_stop_signal_epoch is not None:
-			v = _series_value_at_epoch(s_acc, int(early_stop_signal_epoch))
-			if v is not None:
-				axes[0].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-	if s_f1:
-		axes[1].plot([e for e, _ in s_f1], [v for _, v in s_f1], marker="o")
-		if early_stop_signal_epoch is not None:
-			v = _series_value_at_epoch(s_f1, int(early_stop_signal_epoch))
-			if v is not None:
-				axes[1].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-	if s_loss:
-		axes[2].plot([e for e, _ in s_loss], [v for _, v in s_loss], marker="o")
-		if early_stop_signal_epoch is not None:
-			v = _series_value_at_epoch(s_loss, int(early_stop_signal_epoch))
-			if v is not None:
-				axes[2].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
-	for ax in axes:
-		ax.set_xlabel("epoch")
-		ax.grid(True, alpha=0.25, linestyle="--")
-	fig.tight_layout()
-	fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
-	plt.close(fig)
+	if obj == "generation":
+		series_list: List[Tuple[str, List[Tuple[int, float]]]] = []
+		for m in bench_metrics:
+			k = str(m).strip()
+			if not k:
+				continue
+			ser = get_series(recs, f"bench.{dataset}-val.{k}")
+			if ser:
+				series_list.append((bench_labels.get(k, f"Validation ({k})"), ser))
+		if not series_list:
+			for fb in ("loss_assistant_only", "loss", "ppl", "bleu"):
+				ser = get_series(recs, f"bench.{dataset}-val.{fb}")
+				if ser:
+					series_list.append((bench_labels.get(fb, fb), ser))
+					break
+		nplots = len(series_list)
+		if nplots > 0:
+			ncols = min(3, nplots)
+			nrows = int(np.ceil(nplots / float(ncols)))
+			fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.2 * nrows))
+			axes_arr = np.atleast_1d(axes).reshape(-1)
+			for ax_i, (title, ser) in enumerate(series_list):
+				ax = axes_arr[ax_i]
+				ax.set_title(title, fontsize=10)
+				ax.plot([e for e, _ in ser], [v for _, v in ser], marker="o")
+				if early_stop_signal_epoch is not None:
+					v = _series_value_at_epoch(ser, int(early_stop_signal_epoch))
+					if v is not None:
+						ax.scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
+				ax.set_xlabel("epoch")
+				ax.grid(True, alpha=0.25, linestyle="--")
+			for ax in axes_arr[nplots:]:
+				ax.axis("off")
+			fig.tight_layout()
+			fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
+			plt.close(fig)
+	else:
+		s_acc = get_series(recs, f"bench.{dataset}-val.accuracy")
+		s_f1 = get_series(recs, f"bench.{dataset}-val.f1_macro")
+		s_loss = get_series(recs, f"bench.{dataset}-val.loss")
+
+		fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.6))
+		axes[0].set_title("Validation accuracy")
+		axes[1].set_title("Validation F1 (macro)")
+		axes[2].set_title("Validation loss")
+		if s_acc:
+			axes[0].plot([e for e, _ in s_acc], [v for _, v in s_acc], marker="o")
+			if early_stop_signal_epoch is not None:
+				v = _series_value_at_epoch(s_acc, int(early_stop_signal_epoch))
+				if v is not None:
+					axes[0].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
+		if s_f1:
+			axes[1].plot([e for e, _ in s_f1], [v for _, v in s_f1], marker="o")
+			if early_stop_signal_epoch is not None:
+				v = _series_value_at_epoch(s_f1, int(early_stop_signal_epoch))
+				if v is not None:
+					axes[1].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
+		if s_loss:
+			axes[2].plot([e for e, _ in s_loss], [v for _, v in s_loss], marker="o")
+			if early_stop_signal_epoch is not None:
+				v = _series_value_at_epoch(s_loss, int(early_stop_signal_epoch))
+				if v is not None:
+					axes[2].scatter([int(early_stop_signal_epoch)], [v], color="red", s=46, zorder=5)
+		for ax in axes:
+			ax.set_xlabel("epoch")
+			ax.grid(True, alpha=0.25, linestyle="--")
+		fig.tight_layout()
+		fig.savefig(os.path.join(fig_dir, "fig_quality_progress.png"))
+		plt.close(fig)
 
 	# Representation metrics progress (computed topo/spectral characteristics).
 	repr_keys_all = [k for k in list_scalar_series_keys(recs) if k.startswith("repr.layers.")]
@@ -1507,6 +1719,12 @@ def main():
 	ap.add_argument("--nlp_gen_log_token_lens", action="store_true", help="Log token length stats (max/p95/p99) for prompt/target/total.")
 	ap.add_argument("--nlp_gen_scan_token_lens", action="store_true", help="Scan the selected dataset subset and print token length stats before training.")
 	ap.add_argument("--nlp_gen_scan_token_lens_only", action="store_true", help="If set, run the token length scan and exit before training.")
+	ap.add_argument(
+		"--nlp_gen_length_grouping",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Sort generation training examples by sequence length before batching (stabler tqdm ETA).",
+	)
 
 	# fine-tune strategies
 	ap.add_argument(
@@ -2121,11 +2339,41 @@ def main():
 				return out
 
 			bundle.collate_fn = _qa_gen_collate
+		train_batch_sampler: Optional[LengthGroupedBatchSampler] = None
 		loaders = make_dataloaders(bundle, batch_size=args.batch_size, num_workers=0)
 		train_loader = loaders["train"]
 		val_loader = loaders["val"] or loaders["test"]
 		if train_loader is None or val_loader is None:
 			raise RuntimeError("Dataset did not provide required splits.")
+		if (
+			str(args.task).lower().strip() == "nlp"
+			and nlp_objective == "generation"
+			and bool(getattr(args, "nlp_gen_length_grouping", True))
+			and bundle.train is not None
+			and bundle.collate_fn is not None
+		):
+			try:
+				if nlp_tokenizer is None:
+					raise RuntimeError("Tokenizer is required for length-grouped NLP generation training.")
+				lens = _precompute_generation_total_lengths(bundle.train, nlp_tokenizer)
+				train_batch_sampler = LengthGroupedBatchSampler(
+					lens,
+					int(args.batch_size),
+					shuffle_batches=True,
+					seed=int(args.seed),
+					drop_last=False,
+				)
+				train_loader = DataLoader(
+					bundle.train,
+					batch_sampler=train_batch_sampler,
+					num_workers=0,
+					collate_fn=bundle.collate_fn,
+				)
+				loaders["train"] = train_loader
+				print(f"[NLP] Length-grouped training: batches_per_epoch={len(train_batch_sampler)} batch_size_cap={int(args.batch_size)}")
+			except Exception as e:
+				print("[NLP] Length grouping disabled:", e)
+				train_batch_sampler = None
 
 		num_classes = _infer_num_classes(bundle.train) if bundle.train is not None else _infer_num_classes(bundle.val or bundle.test)
 
@@ -2155,6 +2403,19 @@ def main():
 					cfg = AutoConfig.from_pretrained(model_id)
 					model = AutoModelForCausalLM.from_config(cfg)
 				model.to(device)
+				try:
+					pad_tid = getattr(nlp_tokenizer, "pad_token_id", None)
+					if pad_tid is None:
+						pad_tid = getattr(nlp_tokenizer, "eos_token_id", None)
+					if pad_tid is not None:
+						mc = getattr(model, "config", None)
+						if mc is not None:
+							mc.pad_token_id = int(pad_tid)
+						gc = getattr(model, "generation_config", None)
+						if gc is not None:
+							gc.pad_token_id = int(pad_tid)
+				except Exception as e:
+					print("[Model] Failed to set pad_token_id on causal LM config:", e)
 				layer_names = _pick_transformer_blocks_generic_for_model(model)
 				loss_fn = None
 			else:
@@ -2613,11 +2874,17 @@ def main():
 		early_signal_epoch: Optional[int] = None
 		early_signal_main_metric: Optional[float] = None
 
-		best = {"metric": -1.0, "epoch": -1, "bench": "", "metric_name": ""}
+		# Use -inf so "maximize score" works for generation (-ppl / -loss are often < -1).
+		best = {"metric": float("-inf"), "epoch": -1, "bench": "", "metric_name": ""}
 		t0_total = time.perf_counter()
 		for epoch in range(int(args.epochs)):
 			t_epoch0 = time.perf_counter()
 			monitor.reset_epoch()
+			if train_batch_sampler is not None:
+				try:
+					train_batch_sampler.set_epoch(int(epoch))
+				except Exception as e:
+					print("[NLP] train_batch_sampler.set_epoch failed:", e)
 
 			# Schedule heavy dim=2 / q=1 computations (affects end_epoch only)
 			dim2_on = _schedule(epoch, base=args.build_triangles, every=args.dim2_every)
@@ -2641,6 +2908,9 @@ def main():
 					desc=f"train e{epoch}",
 					leave=False,
 					dynamic_ncols=True,
+					mininterval=1.0,
+					miniters=10,
+					smoothing=0.05,
 				)
 				for bi, batch in train_it:
 					if args.max_train_batches and bi >= args.max_train_batches:
@@ -2748,6 +3018,9 @@ def main():
 					desc=f"val e{epoch}",
 					leave=False,
 					dynamic_ncols=True,
+					mininterval=1.0,
+					miniters=10,
+					smoothing=0.05,
 				)
 				for bi, batch in val_it:
 					if args.max_val_batches and bi >= args.max_val_batches:
@@ -2844,7 +3117,12 @@ def main():
 					if should_stop and not early_signal_logged:
 						early_signal_logged = True
 						early_signal_epoch = int(epoch)
-						early_signal_main_metric = float(mm.get("f1_macro", mm.get("accuracy", -1.0)) or -1.0)
+						if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+							early_signal_main_metric = float(
+								mm.get("loss_assistant_only", mm.get("loss", mm.get("ppl", -1.0))) or -1.0
+							)
+						else:
+							early_signal_main_metric = float(mm.get("f1_macro", mm.get("accuracy", -1.0)) or -1.0)
 						store.log(
 							"early_stop_signal",
 							{
@@ -2879,7 +3157,15 @@ def main():
 								payload={
 									"kind": "early_signal",
 									"main_metric": float(early_signal_main_metric),
-									"main_metric_name": ("f1_macro" if "f1_macro" in mm else "accuracy"),
+									"main_metric_name": (
+										"loss_assistant_only"
+										if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and "loss_assistant_only" in mm)
+										else (
+											"ppl"
+											if (str(args.task).lower().strip() == "nlp" and nlp_objective == "generation" and "ppl" in mm)
+											else ("f1_macro" if "f1_macro" in mm else "accuracy")
+										)
+									),
 									"task": str(args.task),
 									"dataset": str(args.dataset),
 									"model": str(args.model),
@@ -2900,9 +3186,11 @@ def main():
 							_rewrite_progress_figures(
 								store.run_dir,
 								dataset=str(args.dataset),
+								bench_metrics=bench_metrics,
+								nlp_objective=str(nlp_objective),
 								early_stop_key=early_stop_key,
 								early_stop_signal_epoch=early_signal_epoch,
-			)
+							)
 
 			# Extra eval on noisy val (CV)
 			if noisy_val_loader is not None:
@@ -2911,8 +3199,24 @@ def main():
 				m = evaluate_classification(model, noisy_val_loader, loss_fn=loss_fn, max_batches=(args.max_val_batches or None))
 				store.log("noisy_val", {"epoch": epoch, "sigma": float(args.cv_noise_sigma), "metrics": m})
 
-			# Track best by f1_macro if available, else accuracy.
-			if "f1_macro" in mm:
+			# Track best: higher score is better (generation uses negative loss / negative ppl).
+			if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
+				if mm.get("ppl") is not None and np.isfinite(float(mm.get("ppl"))):
+					score = -float(mm["ppl"])
+					main_metric_name = "ppl"
+				elif mm.get("loss_assistant_only") is not None:
+					score = -float(mm["loss_assistant_only"])
+					main_metric_name = "loss_assistant_only"
+				elif mm.get("loss") is not None:
+					score = -float(mm["loss"])
+					main_metric_name = "loss"
+				elif mm.get("bleu") is not None:
+					score = float(mm["bleu"])
+					main_metric_name = "bleu"
+				else:
+					score = float("-inf")
+					main_metric_name = "none"
+			elif "f1_macro" in mm:
 				score = float(mm.get("f1_macro", -1.0) or -1.0)
 				main_metric_name = "f1_macro"
 			elif "accuracy" in mm:
@@ -2957,6 +3261,8 @@ def main():
 				_rewrite_progress_figures(
 					store.run_dir,
 					dataset=str(args.dataset),
+					bench_metrics=bench_metrics,
+					nlp_objective=str(nlp_objective),
 					early_stop_key=early_stop_key,
 					early_stop_signal_epoch=early_signal_epoch,
 				)

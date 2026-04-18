@@ -178,7 +178,12 @@ def evaluate_generation_bleu(
 
 	pad_id = getattr(tokenizer, "pad_token_id", None)
 	if pad_id is None:
+		pad_id = getattr(tokenizer, "eos_token_id", None)
+	if pad_id is None:
 		pad_id = 0
+	# Avoid transformers warning spam during open-ended generation.
+	if "pad_token_id" not in gen_kwargs:
+		gen_kwargs["pad_token_id"] = int(pad_id)
 
 	loss_sum = 0.0
 	loss_n = 0
