@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 
 def _project_root() -> str:
@@ -422,6 +423,11 @@ def main() -> None:
 	last_epoch = int(obj.get("epoch", -1))
 	global_step = int(obj.get("global_step", 0))
 	next_epoch = last_epoch + 1
+	try:
+		cur_lr = float(opt.param_groups[0].get("lr", float("nan")))
+	except Exception:
+		cur_lr = float("nan")
+	print(f"[ResumeOneEpoch] start epoch={next_epoch} global_step={global_step} lr={cur_lr}")
 
 	# Match tools/run_experiment.py: optionally schedule heavy computations by epoch.
 	dim2_on = _schedule(next_epoch, base=bool(ckpt_args.get("build_triangles", False)), every=int(ckpt_args.get("dim2_every", 0) or 0))
@@ -436,7 +442,23 @@ def main() -> None:
 	t0_train = time.perf_counter()
 	with monitor.attach(model):
 		max_train_batches = int(ckpt_args.get("max_train_batches", 0) or 0)
-		for bi, batch in enumerate(train_loader):
+		try:
+			train_total = int(len(train_loader))
+		except Exception:
+			train_total = None
+		if max_train_batches:
+			train_total = int(min(int(max_train_batches), train_total)) if train_total is not None else int(max_train_batches)
+		train_it = tqdm(
+			enumerate(train_loader),
+			total=train_total,
+			desc=f"train e{next_epoch}",
+			leave=False,
+			dynamic_ncols=True,
+			mininterval=1.0,
+			miniters=10,
+			smoothing=0.05,
+		)
+		for bi, batch in train_it:
 			if max_train_batches and bi >= max_train_batches:
 				break
 			opt.zero_grad()
@@ -454,6 +476,11 @@ def main() -> None:
 			global_step += 1
 			if lr_sched is not None:
 				lr_sched.step()
+			try:
+				lr_now = float(opt.param_groups[0].get("lr", float("nan")))
+			except Exception:
+				lr_now = float("nan")
+			train_it.set_postfix(loss=float(loss.detach().item()), lr=lr_now, step=int(global_step))
 			attn = batch.get("attention_mask", None)
 			monitor.collect("train", attention_mask=attn)
 	t_train = float(time.perf_counter() - t0_train)
@@ -463,12 +490,34 @@ def main() -> None:
 	t0_val = time.perf_counter()
 	with torch.no_grad(), monitor.attach(model):
 		max_val_batches = int(ckpt_args.get("max_val_batches", 0) or 0)
-		for bi, batch in enumerate(val_loader):
+		try:
+			val_total = int(len(val_loader))
+		except Exception:
+			val_total = None
+		if max_val_batches:
+			val_total = int(min(int(max_val_batches), val_total)) if val_total is not None else int(max_val_batches)
+		val_it = tqdm(
+			enumerate(val_loader),
+			total=val_total,
+			desc=f"val e{next_epoch}",
+			leave=False,
+			dynamic_ncols=True,
+			mininterval=1.0,
+			miniters=10,
+			smoothing=0.05,
+		)
+		for bi, batch in val_it:
 			if max_val_batches and bi >= max_val_batches:
 				break
 			batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in (batch or {}).items()}
 			fwd = {k: v for k, v in batch.items() if k not in ("gen_input_ids", "gen_attention_mask", "gen_ref_labels")}
-			_ = model(**fwd)
+			out = model(**fwd)
+			try:
+				vloss = out.loss if hasattr(out, "loss") else None
+				if isinstance(vloss, torch.Tensor):
+					val_it.set_postfix(loss=float(vloss.detach().item()))
+			except Exception:
+				pass
 			attn = batch.get("attention_mask", None)
 			monitor.collect("val", attention_mask=attn)
 	t_val = float(time.perf_counter() - t0_val)
