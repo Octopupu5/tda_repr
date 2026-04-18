@@ -255,3 +255,57 @@ def evaluate_generation_bleu(
 		except OverflowError:
 			out["ppl"] = float("inf")
 	return out
+
+
+def evaluate_generation_loss_ppl(
+	model: Any,
+	dataloader: Any,
+	device: Optional[Any] = None,
+	max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+	"""
+	Evaluate a causal LM using only forward loss (no generation / decoding).
+
+	Expected dataloader batches: mappings with 'input_ids' and token-level 'labels'.
+	Optionally uses 'attention_mask' if present.
+	Returns:
+	- loss (assistant-only for our collate_fn that masks prompts with -100)
+	- loss_assistant_only (alias)
+	- ppl
+	"""
+	device = device or next(model.parameters()).device
+	model.eval()
+
+	loss_sum = 0.0
+	loss_n = 0
+	with torch.no_grad():
+		for bi, batch in enumerate(dataloader):
+			if max_batches is not None and bi >= max_batches:
+				break
+			if not isinstance(batch, Mapping):
+				raise TypeError("Expected batch to be a mapping with input_ids/labels")
+			batch = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+			input_ids = batch.get("input_ids", None)
+			labels = batch.get("labels", None)
+			if input_ids is None or labels is None:
+				raise KeyError("Batch must include 'input_ids' and 'labels'.")
+			attn = batch.get("attention_mask", None)
+			if attn is None:
+				out = model(input_ids=input_ids, labels=labels)
+			else:
+				out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+			if not (hasattr(out, "loss") and out.loss is not None):
+				raise ValueError("CausalLM forward did not return .loss; ensure batch contains token-level 'labels'.")
+			loss_sum += float(out.loss.item())
+			loss_n += 1
+
+	if loss_n <= 0:
+		return {"loss": float("nan"), "loss_assistant_only": float("nan"), "ppl": float("nan")}
+
+	loss = float(loss_sum / loss_n)
+	out = {"loss": loss, "loss_assistant_only": loss}
+	try:
+		out["ppl"] = float(math.exp(loss))
+	except OverflowError:
+		out["ppl"] = float("inf")
+	return out
