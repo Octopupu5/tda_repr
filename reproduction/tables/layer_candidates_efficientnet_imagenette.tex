@@ -1,0 +1,12 @@
+\toprule
+\textbf{Selection method} & \textbf{Layer} & \textbf{$R$} & \textbf{Gap ($\Delta R$)} & \textbf{Descriptor} & \textbf{$|\rho_S|$}\\
+\midrule
+Best by $R$ & \texttt{classifier} & 0.680 & -0.000 & --- & --- \\
+Default layer & \texttt{classifier.0} & --- & --- & --- & --- \\
+Best among topological candidates ($|\rho| \ge 0.6$, $p \le 0.05$) & \texttt{classifier} & 0.680 & -0.000 & $\beta_1^{K,L}$ & 0.728 \\
+Max $|\rho_S|$ (topological) & \texttt{classifier} & 0.680 & -0.000 & $\beta_1^{K,L}$ & 0.728 \\
+Best among spectral candidates ($|\rho| \ge 0.6$, $p \le 0.05$) & \texttt{features.7.0} & 0.680 & -0.000 & $\lambda_3\left(\Delta_0\left(L\right)\right)$ & 0.832 \\
+Max $|\rho_S|$ (spectral) & \texttt{features.4.1} & --- & --- & $\lambda_3\left(\Delta_0^{K,L}\right)$ & 0.844 \\
+Best among MTopDiv candidates ($|\rho| \ge 0.6$, $p \le 0.05$) & \texttt{classifier} & 0.680 & -0.000 & $\mathrm{MTopDiv}$ & 0.940 \\
+Max $|\rho_S|$ (MTopDiv) & \texttt{classifier} & 0.680 & -0.000 & $\mathrm{MTopDiv}$ & 0.940 \\
+\bottomrule

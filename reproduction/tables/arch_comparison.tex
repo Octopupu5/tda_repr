@@ -1,0 +1,17 @@
+\toprule
+\textbf{Architecture} & \textbf{Dataset} & $\mathbf{\Delta \text{Task Metric}}$ & $\mathbf{\Delta \beta_1^{K,L}}$ & \textbf{$\Delta \text{MTopDiv}$} & $\mathbf{\Delta \lambda_2(\Delta_0(L))}$ & $\mathbf{\Delta \lambda_1(\Delta_1^{K,L})}$ \\
+\midrule
+MLP                       & MNIST                   & $+0.02 \pm 0.01$ (F1) & $-16.5 \pm 37.7$  & $+183.4 \pm 43.3$  & $-0.86 \pm 0.50$ & $-0.08 \pm 0.03$ \\
+ResNet18                  & CIFAR-10                & $+0.19 \pm 0.11$ (F1) & $+0.4 \pm 1.1$  & $+0.7 \pm 1.5$  & $+0.07 \pm 0.67$ & $-0.06 \pm 0.12$ \\
+ResNet18                  & BloodMNIST              & $+0.10 \pm 0.05$ (F1) & $-0.2 \pm 0.5$  & $+3.5 \pm 1.0$  & $-0.37 \pm 0.06$ & $-0.04 \pm 0.00$ \\
+ResNet18                  & ImageNette              & $+0.08 \pm 0.01$ (F1) & $+0.5 \pm 0.6$  & $+1.7 \pm 2.7$  & $-0.72 \pm 0.09$ & $-0.09 \pm 0.03$ \\
+EfficientNet-B0           & CIFAR-10                & $+0.27 \pm 0.03$ (F1) & $+1.8 \pm 0.5$  & $+42.9 \pm 7.9$  & $-0.23 \pm 0.40$ & $-0.03 \pm 0.03$ \\
+EfficientNet-B0           & BloodMNIST              & $+0.17 \pm 0.11$ (F1) & $-24.4 \pm 40.5$  & $+24.3 \pm 14.9$  & $-0.57 \pm 0.12$ & $-0.06 \pm 0.02$ \\
+EfficientNet-B0           & ImageNette              & $+0.42 \pm 0.07$ (F1) & $-14.4 \pm 34.5$  & $+78.4 \pm 11.7$  & $-0.08 \pm 0.27$ & $-0.02 \pm 0.04$ \\
+ConvNeXt-Tiny             & CIFAR-10                & $+0.39 \pm 0.23$ (F1) & $-0.2 \pm 1.3$  & $+489.2 \pm 434.7$  & $+0.41 \pm 0.29$ & $-0.02 \pm 0.07$ \\
+ConvNeXt-Tiny             & BloodMNIST              & $+0.30 \pm 0.47$ (F1) & $+0.2 \pm 0.8$  & $+192.1 \pm 280.4$  & $-0.09 \pm 0.06$ & $-0.09 \pm 0.17$ \\
+ConvNeXt-Tiny             & ImageNette              & $+0.35 \pm 0.31$ (F1) & $+0.0 \pm 0.0$  & $+513.3 \pm 477.7$  & $+0.75 \pm 0.73$ & $+0.08 \pm 0.08$ \\
+DistilBERT                & SST-2                   & $+0.02 \pm 0.01$ (F1) & $-1.7 \pm 0.7$  & $-8.3 \pm 4.0$  & $-3.26 \pm 2.30$ & $-0.26 \pm 0.06$ \\
+DistilBERT                & Trec-6                  & $+0.38 \pm 0.08$ (F1) & $-0.7 \pm 1.9$  & $-28.4 \pm 8.9$  & $-7.41 \pm 5.77$ & $-0.34 \pm 0.14$ \\
+SmolLM                    & smol-summarize          & $+0.80 \pm 0.00$ (PPL) & $+0.0 \pm 0.0$  & $-24.6 \pm 0.0$  & $+0.81 \pm 0.00$ & $-0.38 \pm 0.00$ \\
+\bottomrule

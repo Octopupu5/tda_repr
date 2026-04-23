@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from tools.figures.i18n import I18N
 from tda_repr.data import get_dataset
 from tda_repr.models import LayerTaps, list_module_names
-from tools.run_experiment import _build_text_model, _infer_num_classes, _repr_from_activation
+from tools._shared import build_text_model, infer_num_classes, repr_from_activation
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -65,7 +65,7 @@ def _first_tensor(x: Any) -> Optional[torch.Tensor]:
 
 
 def _repr_from_hook_output(act: Any) -> Optional[torch.Tensor]:
-	z = _repr_from_activation(act)
+	z = repr_from_activation(act)
 	if isinstance(z, torch.Tensor):
 		return z
 	t = _first_tensor(act)
@@ -187,10 +187,10 @@ def main() -> None:
 
 	num_classes = int(payload.get("num_classes", meta.get("num_classes", 0)) or 0)
 	if num_classes <= 0:
-		num_classes = _infer_num_classes(bundle.train) if bundle.train is not None else _infer_num_classes(ds)
+		num_classes = infer_num_classes(str(args.dataset), bundle.train if bundle.train is not None else ds)
 
 	device = torch.device(str(args.device))
-	model, _layer_names = _build_text_model(kind=str(model_kind), num_classes=int(num_classes), device=device, pretrained=False)
+	model, _layer_names = build_text_model(str(model_kind), num_classes=int(num_classes), device=device, pretrained=False)
 
 	state_dict = ckpt.get("state_dict", None) if isinstance(ckpt, dict) else None
 	if not isinstance(state_dict, dict):

@@ -1,0 +1,19 @@
+\textbf{Architecture} & \textbf{Dataset} & \textbf{Exhaustive Best Layer} & \textbf{Max $R$} & \textbf{Proposed Best Layer} & \textbf{Yielded $R$} & \textbf{Gap ($\Delta R$)} \\
+\midrule
+MLP & MNIST & \texttt{4} & 0.970 & \texttt{4} & 0.970 & 0.000 \\
+\midrule
+ResNet18 & CIFAR-10 & \texttt{avgpool} / \texttt{layer4.1} & 0.861 & \texttt{avgpool} & 0.861 & 0.000 \\
+ResNet18 & BloodMNIST & \texttt{avgpool} / \texttt{fc} / \texttt{layer4.1} & 0.979 & \texttt{avgpool} & 0.979 & 0.000 \\
+ResNet18 & ImageNette & \texttt{avgpool} / \texttt{fc} / \texttt{layer4.1} & 0.864 & \texttt{avgpool} & 0.864 & 0.000 \\
+\midrule
+EfficientNet-B0 & CIFAR-10 & \texttt{features.7} / \texttt{features.7.0} & 0.811 & \texttt{features.7.0} & 0.811 & 0.000 \\
+EfficientNet-B0 & BloodMNIST & \texttt{avgpool} / \texttt{features.8.1} & 0.977 & \texttt{features.8.1} & 0.977 & 0.000 \\
+EfficientNet-B0 & ImageNette & \texttt{features.7} / \texttt{features.7.0} & 0.697 & \texttt{features.7.0} & 0.697 & 0.000 \\
+\midrule
+ConvNeXt-Tiny & CIFAR-10 & \texttt{classifier.0} / \texttt{classifier.1} & 0.893 & \texttt{classifier.1} & 0.893 & 0.000 \\
+ConvNeXt-Tiny & BloodMNIST & \texttt{classifier} / \texttt{classifier.2} & 0.981 & \texttt{classifier.2} & 0.981 & 0.000 \\
+ConvNeXt-Tiny & ImageNette & \texttt{classifier.0} / \texttt{classifier.1} & 0.958 & \texttt{classifier.1} & 0.958 & 0.000 \\
+\midrule
+DistilBERT & SST-2 & \texttt{layer.5} & 0.907 & \texttt{layer.5} & 0.907 & 0.000 \\
+DistilBERT & TREC-6 & \texttt{layer.5} & 0.750 & \texttt{layer.5} & 0.750 & 0.000 \\
+\bottomrule

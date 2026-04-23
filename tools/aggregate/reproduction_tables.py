@@ -402,12 +402,12 @@ def build_analysis_tex_tables(
 
 
 EXPECTED_REPRODUCTION_IMAGES_EN = (
+	"fig_early_stopping_trec6.png",
+	"fig_early_stopping_triplet.png",
+	"fig_efficientnet_b0_bloodmnist_neighbors.png",
+	"fig_efficientnet_b0_imagenette_neighbors.png",
 	"fig_layer_dynamics.png",
 	"fig_layerwise_dynamics_conv_blood.png",
 	"fig_layerwise_dynamics_distilbert_trec6.png",
-	"fig_early_stopping_trec6.png",
-	"fig_smollm_topo_spectral_dynamics.png",
-	"fig_early_stopping_triplet.png",
 	"fig_trec6_distilbert_neighbors.png",
-	"fig_efficientnet_imagenette_embedding_compare.png",
 )

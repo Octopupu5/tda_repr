@@ -7,13 +7,8 @@ import shutil
 import sys
 from collections.abc import Sequence
 
-from tools.figures.reproduction_figures import render_all_figure_artifacts, resolve_figure_bundle_paths, run_command, render_embedding_comparison
-from tools.aggregate.reproduction_paths import (
-	DEFAULT_FIGURES_RUNS_ROOT,
-	DIPLOMA_PICTURES_DIR,
-	LATEX_PICTURES_DIR,
-	TABLES_DIR,
-)
+from tools.figures.reproduction_figures import render_all_figure_artifacts, resolve_figure_bundle_paths, run_command
+from tools.aggregate.reproduction_paths import DEFAULT_FIGURES_RUNS_ROOT
 from tools.aggregate.layer_tables_from_embeddings import write_layer_candidate_table_tex
 
 
@@ -36,10 +31,11 @@ def _load_meta_model_lc(run_dir: str) -> str:
 	return model
 
 
-def _write_case_candidate_tables(*, figures_root: str) -> None:
+def _write_case_candidate_tables(*, figures_root: str, tables_dir: str) -> None:
 	root = os.path.abspath(str(figures_root))
-	os.makedirs(os.path.abspath(TABLES_DIR), exist_ok=True)
-	tmp = os.path.join(os.path.abspath(TABLES_DIR), "_tmp_case_candidates")
+	tables_abs = os.path.abspath(str(tables_dir))
+	os.makedirs(tables_abs, exist_ok=True)
+	tmp = os.path.join(tables_abs, "_tmp_case_candidates")
 	os.makedirs(tmp, exist_ok=True)
 	for fn in os.listdir(tmp):
 		fp = os.path.join(tmp, fn)
@@ -49,7 +45,7 @@ def _write_case_candidate_tables(*, figures_root: str) -> None:
 	cases = {
 		"efficientnet_b0_bloodmnist": "exp_20260505_033618_cv_bloodmnist_efficientnet_b0_ft-full",
 		"efficientnet_b0_imagenette": "exp_20260404_182533_cv_imagenette_efficientnet_b0_ft-full",
-		"distilbert_trec6": "exp_20260408_114511_nlp_trec6_distilbert_ft-full",
+		"distilbert_trec6": "exp_20260403_042415_nlp_trec6_distilbert_ft-full",
 	}
 	for spec_key, rel_run in cases.items():
 		run_dir = os.path.join(root, rel_run)
@@ -65,9 +61,10 @@ def _write_case_candidate_tables(*, figures_root: str) -> None:
 		if not fn.endswith(".tex"):
 			continue
 		src = os.path.join(tmp, fn)
-		dst = os.path.join(os.path.abspath(TABLES_DIR), _strip_table_prefix(fn))
+		dst = os.path.join(tables_abs, _strip_table_prefix(fn))
 		shutil.copy2(src, dst)
 	shutil.rmtree(tmp, ignore_errors=True)
+
 
 def _ensure_empty_dir(path: str) -> None:
 	p = os.path.abspath(path)
@@ -101,10 +98,6 @@ def _copy_neighbor_figures_from_saved_runs(*, figures_root: str, out_dir: str) -
 			"exp_20260505_033618_cv_bloodmnist_efficientnet_b0_ft-full",
 			"embedding_retrieval_model_best_main__layer_features.8.1.png",
 		),
-		"fig_efficientnet_b0_imagenette_neighbors.png": (
-			"exp_20260404_182533_cv_imagenette_efficientnet_b0_ft-full",
-			"embedding_retrieval_model_best_main__layer_features.7.0.png",
-		),
 	}
 	for out_name, (run_rel, src_name) in specs.items():
 		src = os.path.join(root, run_rel, "analysis", src_name)
@@ -122,9 +115,20 @@ def main() -> None:
 	)
 	ap.add_argument("--device", default="cpu")
 	ap.add_argument("--download", action="store_true")
+	ap.add_argument(
+		"--reproduction-root",
+		default="reproduction",
+		help="Root directory for diploma_pictures, latex_pictures, and tables (default: reproduction).",
+	)
 	args = ap.parse_args()
 
 	repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+	repro_root = str(args.reproduction_root).strip() or "reproduction"
+	repro_root_abs = repro_root if os.path.isabs(repro_root) else os.path.abspath(os.path.join(repo_root, repro_root))
+	diploma_dir = os.path.join(repro_root_abs, "diploma_pictures")
+	latex_dir = os.path.join(repro_root_abs, "latex_pictures")
+	tables_dir = os.path.join(repro_root_abs, "tables")
 
 	runs_root = args.figures_root
 	if runs_root is None:
@@ -141,9 +145,9 @@ def main() -> None:
 		"fig_trec6_distilbert_neighbors.png",
 	)
 
-	_ensure_empty_dir(DIPLOMA_PICTURES_DIR)
+	_ensure_empty_dir(diploma_dir)
 	render_all_figure_artifacts(
-		out_dir=DIPLOMA_PICTURES_DIR,
+		out_dir=diploma_dir,
 		lang="ru",
 		figures_run_root=runs_root,
 		device=str(args.device),
@@ -151,14 +155,14 @@ def main() -> None:
 		download_embedding=bool(args.download),
 	)
 	keep = set(diploma_keep_from_render)
-	for fn in os.listdir(os.path.abspath(DIPLOMA_PICTURES_DIR)):
-		fp = os.path.join(os.path.abspath(DIPLOMA_PICTURES_DIR), fn)
+	for fn in os.listdir(os.path.abspath(diploma_dir)):
+		fp = os.path.join(os.path.abspath(diploma_dir), fn)
 		if os.path.isfile(fp) and fn not in keep:
 			os.remove(fp)
 
-	_copy_neighbor_figures_from_saved_runs(figures_root=runs_root, out_dir=DIPLOMA_PICTURES_DIR)
+	_copy_neighbor_figures_from_saved_runs(figures_root=runs_root, out_dir=diploma_dir)
 
-	_ensure_empty_dir(LATEX_PICTURES_DIR)
+	_ensure_empty_dir(latex_dir)
 	resolved = resolve_figure_bundle_paths(runs_root)
 	py = sys.executable
 
@@ -172,7 +176,7 @@ def main() -> None:
 			"--run_b",
 			resolved.run_smollm,
 			"--out_png",
-			os.path.join(os.path.abspath(LATEX_PICTURES_DIR), "Figure_1_dynamics.png"),
+			os.path.join(os.path.abspath(latex_dir), "Figure_1_dynamics.png"),
 			"--style",
 			"paper",
 			"--lang",
@@ -180,14 +184,44 @@ def main() -> None:
 		]
 	)
 
-	render_embedding_comparison(
-		py_exe=py,
-		out_png=os.path.join(os.path.abspath(LATEX_PICTURES_DIR), "Figure_2_layer_example.png"),
-		run_efficientnet_imagenette=resolved.run_eff_imagenette,
-		layers_csv=resolved.eff_embedding_layers,
-		device=str(args.device),
-		download=bool(args.download),
-	)
+	argv = [
+		py,
+		"-m",
+		"tools.evaluate_embeddings",
+		"--run_dir",
+		resolved.run_eff_imagenette,
+		"--checkpoint",
+		"best_main",
+		"--split",
+		"val",
+		"--layers",
+		"classifier,features.7.0",
+		"--compare_two_layers_top_k",
+		"12",
+		"--anchor_idx",
+		"3744",
+		"--anchors_per_class",
+		"100",
+		"--seed",
+		"0",
+		"--no-skip_existing",
+		"--no-write_bundle",
+		"--device",
+		str(args.device),
+		"--compare_out_png",
+		os.path.join(os.path.abspath(latex_dir), "Figure_2_layer_example.png"),
+		"--neighbors_layer",
+		"features.7.0",
+		"--neighbors_out_png",
+			os.path.join(os.path.abspath(diploma_dir), "fig_efficientnet_b0_imagenette_neighbors.png"),
+		"--neighbors_style",
+		"compact",
+		"--top_k",
+		"20",
+	]
+	if bool(args.download):
+		argv.append("--download")
+	run_command(argv)
 
 	run_command(
 		[
@@ -207,13 +241,13 @@ def main() -> None:
 			"--title",
 			"__none__",
 			"--out_png",
-			os.path.join(os.path.abspath(LATEX_PICTURES_DIR), "Figure_3_early_stopping.png"),
+			os.path.join(os.path.abspath(latex_dir), "Figure_3_early_stopping.png"),
 			"--lang",
 			"en",
 		]
 	)
 
-	_write_case_candidate_tables(figures_root=runs_root)
+	_write_case_candidate_tables(figures_root=runs_root, tables_dir=tables_dir)
 
 
 if __name__ == "__main__":

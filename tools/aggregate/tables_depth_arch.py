@@ -371,7 +371,6 @@ def _display_dataset(ds: str) -> str:
 		"mnist": "MNIST",
 		"trec6": "Trec-6",
 		"sst2": "SST-2",
-		"yahoo_answers_topics": "Yahoo Ans",
 		"smol-summarize": "SmolTalk (summarize)",
 	}.get(k, ds)
 

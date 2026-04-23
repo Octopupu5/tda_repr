@@ -21,7 +21,7 @@ ZENODO_CASE_STUDY_DOI = "10.5281/zenodo.20114914"
 class FigureRunPaths:
 	resnet_imagenette: str = "exp_20260419_160324_cv_imagenette_resnet18_ft-full"
 	smollm_summarize: str = "exp_20260418_211916_nlp_smol-summarize_smollm2-135m_ft-full"
-	blood_cv_layerwise_run: str = "exp_20260406_013322_cv_bloodmnist_convnext_tiny_ft-full"
+	blood_cv_layerwise_run: str = "exp_20260505_194724_cv_bloodmnist_convnext_tiny_ft-full"
 	blood_cv_layerwise_layers: str = "features.1.0,features.3.1,features.5.4"
 	distilbert_trec6: str = "exp_20260408_114511_nlp_trec6_distilbert_ft-full"
 	distilbert_trec6_early_stopping: str = "exp_20260403_042415_nlp_trec6_distilbert_ft-full"

@@ -8,7 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 
 from tools.figures.i18n import I18N
 from tools.repr_early_stop_sweep import (
@@ -44,6 +44,39 @@ def _csv3(s: str) -> list[str]:
 	if len(out) != 3:
 		raise ValueError("Expected exactly 3 comma-separated values.")
 	return out
+
+
+def _apply_paper_style() -> None:
+	plt.rcParams.update(
+		{
+			"font.family": "DejaVu Sans",
+			"text.usetex": False,
+			"mathtext.fontset": "dejavusans",
+			"font.size": 14.0,
+			"axes.labelsize": 18.0,
+			"axes.titlesize": 14.0,
+			"xtick.labelsize": 14.0,
+			"ytick.labelsize": 14.0,
+			"legend.fontsize": 12.5,
+			"axes.linewidth": 1.6,
+			"figure.dpi": 180,
+			"savefig.dpi": 300,
+		}
+	)
+
+
+def _beautify(ax) -> None:
+	ax.grid(True, which="major", color="#AFAFAF", alpha=0.90, linestyle="-", linewidth=1.1)
+	ax.set_axisbelow(True)
+	for sp in ax.spines.values():
+		sp.set_linewidth(1.6)
+	ax.tick_params(direction="out", length=6, width=1.6)
+	ax.xaxis.set_major_locator(MultipleLocator(2))
+
+
+def _short_layer(layer: str) -> str:
+	s = str(layer)
+	return s[len("model.") :] if s.startswith("model.") else s
 
 
 def main() -> None:
@@ -141,13 +174,16 @@ def main() -> None:
 	if str(args.out_pdf).strip():
 		os.makedirs(os.path.dirname(os.path.abspath(str(args.out_pdf))), exist_ok=True)
 
+	_apply_paper_style()
 	fig, axes = plt.subplots(2, 2, figsize=(12.0, 7.2), sharex=True)
 	ax_grid = axes.reshape(-1)
+	for a in ax_grid:
+		_beautify(a)
 
 	ax0 = ax_grid[0]
 	xm = [e for e, _ in main_series]
 	ym = [v for _, v in main_series]
-	ax0.plot(xm, ym, color="#d62728", linewidth=2.2, label=i18n.bench_metric_label(bench_metric))
+	ax0.plot(xm, ym, color="#d62728", linewidth=3.0, marker="o", markersize=5.5, label=i18n.bench_metric_label(bench_metric))
 
 	vs = _value_at(main_series, int(stop_eff))
 	if vs is not None:
@@ -161,23 +197,25 @@ def main() -> None:
 
 	ax0.set_ylabel(i18n.validation_value())
 	ax0.yaxis.set_major_locator(MaxNLocator(nbins=6))
-	ax0.legend(loc="best")
+	ax0.legend(loc="best", frameon=True, framealpha=0.90, facecolor="white", edgecolor="#BBBBBB")
 
 	for i, (sig, ser) in enumerate(zip(signals, signal_series)):
 		ax = ax_grid[i + 1]
 		xs = [e for e, _ in ser]
 		ys = [v for _, v in ser]
-		ax.plot(xs, ys, color="#6a3d9a", linewidth=2.2, label=f"{sig.layer}")
+		layer_txt = _short_layer(str(sig.layer))
+		plat = i18n.plateau_max() if str(sig.mode) == "max" else i18n.plateau_min()
+		ax.plot(xs, ys, color="#6a3d9a", linewidth=2.7, marker="o", markersize=4.8, alpha=0.95, label=f"{layer_txt} ({plat}, p={int(args.patience)})")
 		vsig = _value_at(ser, int(stop_eff))
 		if vsig is not None:
 			ax.axvline(int(stop_eff), color="#d62728", linestyle="--", linewidth=1.2)
 			ax.scatter([int(stop_eff)], [float(vsig)], s=60, color="#1f9d8a", zorder=5)
 		ax.set_ylabel(_pretty_metric(sig.metric))
 		ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
-		ax.legend(loc="best")
+		ax.legend(loc="best", frameon=True, framealpha=0.90, facecolor="white", edgecolor="#BBBBBB")
 
-	ax_grid[2].set_xlabel(i18n.epoch())
-	ax_grid[3].set_xlabel(i18n.epoch())
+	ax_grid[2].set_xlabel(i18n.epoch(), fontweight="bold")
+	ax_grid[3].set_xlabel(i18n.epoch(), fontweight="bold")
 	fig.tight_layout()
 	fig.savefig(str(args.out_png), bbox_inches="tight")
 	if str(args.out_pdf).strip():

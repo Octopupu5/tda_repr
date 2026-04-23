@@ -1,0 +1,10 @@
+\toprule
+\textbf{Architecture} & \textbf{Primary Trigger Signal} & \textbf{Successful Triggers (\%)} & \textbf{Epochs Saved} & \textbf{Gap to Empirical Optimum} \\
+\midrule
+MLP & \texttt{0}: $\lambda_1(\Delta_1^{K,L})$ min & 100.0\% & 4.3 $\pm$ 2.9 & $0.0\% \pm 0.0\% \bigm\left(0.000 \pm 0.000\right)$ \\
+ResNet18 & \texttt{layer2.0}: $\beta_1(L)$ min & 66.7\% & 2.6 $\pm$ 2.4 & $0.0\% \pm 0.1\% \bigm\left(-0.000 \pm 0.001\right)$ \\
+EfficientNet-B0 & \texttt{features.6.3}: $\lambda_1(\Delta_1^{K,L})$ min & 100.0\% & 3.0 $\pm$ 1.9 & $0.0\% \pm 0.0\% \bigm\left(-0.000 \pm 0.000\right)$ \\
+ConvNeXt-Tiny & \texttt{features.7}: $\beta_1(L)$ min & 100.0\% & 8.2 $\pm$ 3.8 & $0.4\% \pm 0.5\% \bigm\left(-0.004 \pm 0.005\right)$ \\
+DistilBERT & \texttt{layer.3.ffn}: $\beta_1(L)$ min & 100.0\% & 8.8 $\pm$ 2.7 & $0.5\% \pm 0.4\% \bigm\left(-0.004 \pm 0.004\right)$ \\
+SmolLM & \texttt{layers.16}: $\beta_1(L)$ min & 100.0\% & 10.0 $\pm$ 0.0 & $0.0\% \pm 0.0\% \bigm\left(0.000 \pm 0.000\right)$ \\
+\bottomrule

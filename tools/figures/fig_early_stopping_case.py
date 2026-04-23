@@ -8,7 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 
 from tools.figures.i18n import I18N
 from tools.repr_early_stop_sweep import Signal, _best_epoch, _load_epoch_end_records, _series_bench, _series_signal, _value_at
@@ -29,6 +29,34 @@ def _pretty_metric(metric: str) -> str:
 		"persistent_q1_lambda1": r"$\lambda_1(\Delta_1^{K,L})$",
 		"mtopdiv_train_val": r"$\mathrm{MTopDiv}$",
 	}.get(m, m)
+
+
+def _apply_paper_style() -> None:
+	plt.rcParams.update(
+		{
+			"font.family": "DejaVu Sans",
+			"text.usetex": False,
+			"mathtext.fontset": "dejavusans",
+			"font.size": 14.0,
+			"axes.labelsize": 18.0,
+			"axes.titlesize": 14.0,
+			"xtick.labelsize": 14.0,
+			"ytick.labelsize": 14.0,
+			"legend.fontsize": 12.5,
+			"axes.linewidth": 1.6,
+			"figure.dpi": 180,
+			"savefig.dpi": 300,
+		}
+	)
+
+
+def _beautify(ax) -> None:
+	ax.grid(True, which="major", color="#AFAFAF", alpha=0.90, linestyle="-", linewidth=1.1)
+	ax.set_axisbelow(True)
+	for sp in ax.spines.values():
+		sp.set_linewidth(1.6)
+	ax.tick_params(direction="out", length=6, width=1.6)
+	ax.xaxis.set_major_locator(MultipleLocator(2))
 
 
 def main() -> None:
@@ -117,7 +145,10 @@ def main() -> None:
 	if str(args.out_pdf).strip():
 		os.makedirs(os.path.dirname(os.path.abspath(str(args.out_pdf))), exist_ok=True)
 
+	_apply_paper_style()
 	fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(8.2, 6.0), sharex=True)
+	_beautify(ax0)
+	_beautify(ax1)
 
 	xm = [e for e, _ in main_series]
 	if bench_mode == "max" and bench_metric in {"accuracy", "f1_macro"}:
@@ -126,11 +157,22 @@ def main() -> None:
 	else:
 		ym = [v for _, v in main_series]
 		ax0.set_ylabel(i18n.validation_value())
-	ax0.plot(xm, ym, color="#d62728", linewidth=2.4, label=main_name)
+	ax0.plot(xm, ym, color="#d62728", linewidth=3.0, marker="o", markersize=5.5, label=main_name)
 	if (not str(args.bench_metric).strip()) and s_f1 and s_acc:
 		xa = [e for e, _ in s_acc]
 		ya = [100.0 * v for _, v in s_acc]
-		ax0.plot(xa, ya, color="#1f77b4", linewidth=2.2, linestyle="--", marker="x", markersize=7, label=i18n.accuracy())
+		ax0.plot(
+			xa,
+			ya,
+			color="#1f77b4",
+			linewidth=2.6,
+			linestyle=":",
+			marker="x",
+			markersize=6.5,
+			markeredgewidth=2.0,
+			alpha=0.95,
+			label=i18n.accuracy(),
+		)
 
 	vs = _value_at(main_series, int(stop_eff))
 	if vs is not None:
@@ -145,20 +187,20 @@ def main() -> None:
 			ax0.scatter([int(best_ep)], [float(yb)], s=140, facecolors="none", edgecolors="black", linewidths=2.0, zorder=6, label=i18n.empirical_best())
 
 	ax0.yaxis.set_major_locator(MaxNLocator(nbins=6))
-	ax0.legend(loc="best")
+	ax0.legend(loc="lower right", frameon=True, framealpha=0.90, facecolor="white", edgecolor="#BBBBBB")
 
 	xs = [e for e, _ in s_sig]
 	ys = [v for _, v in s_sig]
-	ax1.plot(xs, ys, color="#6a3d9a", linewidth=2.4, label=_pretty_metric(str(args.metric)))
+	ax1.plot(xs, ys, color="#6a3d9a", linewidth=3.0, marker="o", markersize=5.0, label=_pretty_metric(str(args.metric)))
 	vsig = _value_at(s_sig, int(stop_eff))
 	if vsig is not None:
 		ax1.axvline(int(stop_eff), color="#d62728", linestyle="--", linewidth=1.4)
 		ax1.scatter([int(stop_eff)], [float(vsig)], s=60, color="#1f9d8a", zorder=5)
 
 	ax1.set_ylabel(_pretty_metric(str(args.metric)))
-	ax1.set_xlabel(i18n.epoch())
+	ax1.set_xlabel(i18n.epoch(), fontweight="bold")
 	ax1.yaxis.set_major_locator(MaxNLocator(nbins=6))
-	ax1.legend(loc="best")
+	ax1.legend(loc="best", frameon=True, framealpha=0.90, facecolor="white", edgecolor="#BBBBBB")
 
 	fig.tight_layout()
 	fig.savefig(str(args.out_png), bbox_inches="tight")

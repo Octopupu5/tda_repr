@@ -126,14 +126,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 		best = rows[0] if rows else None
 		obj = {
 			"run_dir": os.path.abspath(rd),
-			"eval_note": "fixed_rules: evaluated only selected primary rule and top-K ensemble rules from selection corpus.",
 			"ranked_by_gap_rel_pct": rows,
 			"ensemble3_oracle_rows": ens_rows,
 			"best": best,
 		}
 		os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
 		with open(out_json, "w", encoding="utf-8") as wf:
-			json.dump(obj, wf, indent=2, ensure_ascii=False)
+			json.dump(obj, wf, separators=(",", ":"), ensure_ascii=False)
 		print("[ok] wrote", out_json, file=sys.stderr)
 
 

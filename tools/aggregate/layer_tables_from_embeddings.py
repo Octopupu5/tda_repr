@@ -271,7 +271,10 @@ def _scalar_cell(opt: Optional[Any]) -> str:
 	if isinstance(opt, float) and not math.isfinite(opt):
 		return "---"
 	try:
-		return f"{float(opt):.3f}"
+		v = float(opt)
+		if abs(v) < 5e-4:
+			v = 0.0
+		return f"{v:.3f}"
 	except (TypeError, ValueError):
 		return "---"
 

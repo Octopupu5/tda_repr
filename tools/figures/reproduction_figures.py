@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -13,6 +12,16 @@ from tools.aggregate.reproduction_paths import FigureRunPaths, resolve_run_dir, 
 
 
 FIGURE_EMBEDDINGS_OUT_NAME = "fig_efficientnet_imagenette_embedding_compare.png"
+
+
+def _safe_name(s: str) -> str:
+	out = []
+	for ch in str(s):
+		if ch.isalnum() or ch in ("_", ".", "-"):
+			out.append(ch)
+		else:
+			out.append("_")
+	return "".join(out)
 
 
 def run_command(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -158,32 +167,6 @@ def iterate_figure_commands(
 		],
 	)
 	yield (
-		"fig_smollm_topo_spectral_dynamics",
-		[
-			py_exe,
-			"-m",
-			"tools.figures.fig_early_stopping_case",
-			"--run_dir",
-			run.run_smollm,
-			"--layer",
-			"model.layers.29",
-			"--metric",
-			"persistent_q1_lambda1",
-			"--mode",
-			"max",
-			"--patience",
-			"5",
-			"--bench_metric",
-			"ppl",
-			"--title",
-			"__none__",
-			"--out_png",
-			out("fig_smollm_topo_spectral_dynamics.png"),
-			"--lang",
-			lang,
-		],
-	)
-	yield (
 		"fig_early_stopping_triplet",
 		[
 			py_exe,
@@ -243,19 +226,6 @@ def render_embedding_comparison(
 	device: str,
 	download: bool,
 ) -> None:
-	ad = os.path.join(run_efficientnet_imagenette, "analysis")
-	if os.path.isdir(ad):
-		candidates = [
-			os.path.join(ad, fn)
-			for fn in os.listdir(ad)
-			if "compare_" in fn and "classifier" in fn and fn.endswith(".png")
-		]
-		if candidates:
-			cmp_png = max(candidates, key=os.path.getmtime)
-			os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
-			shutil.copyfile(cmp_png, out_png)
-			return
-
 	argv = [
 		py_exe,
 		"-m",
@@ -270,21 +240,25 @@ def render_embedding_comparison(
 		layers_csv,
 		"--compare_two_layers_top_k",
 		"12",
+		"--compare_out_png",
+		out_png,
+		"--search_best_illustration_anchor",
+		"--search_min_delta_neighbors",
+		"2",
+		"--anchors_per_class",
+		"100",
+		"--seed",
+		"0",
 		"--device",
 		device,
-		"--skip_existing",
+		"--no-skip_existing",
+		"--no-write_bundle",
 	]
 	if download:
 		argv.append("--download")
 	run_command(argv)
-	if not os.path.isdir(ad):
-		raise RuntimeError(f"Embedding analysis missing after evaluate_embeddings: {ad}")
-	candidates = [os.path.join(ad, fn) for fn in os.listdir(ad) if "compare_" in fn and "classifier" in fn and fn.endswith(".png")]
-	if not candidates:
-		raise RuntimeError(f"No classifier embedding compare PNG in {ad}")
-	cmp_png = max(candidates, key=os.path.getmtime)
-	os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
-	shutil.copyfile(cmp_png, out_png)
+	if not os.path.isfile(os.path.abspath(out_png)):
+		raise RuntimeError(f"Embedding compare PNG was not produced: {out_png}")
 
 
 def render_all_figure_artifacts(

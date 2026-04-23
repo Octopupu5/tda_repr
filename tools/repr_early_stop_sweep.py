@@ -543,13 +543,6 @@ def sweep_run_directory(
 		"benchmark_best_value": float(best_val),
 		"oracle_best_on_run": {"epoch": int(best_ep), "value": float(best_val)},
 		"sweep_spec": {
-			"description": (
-				"Per run: signals beta1_L_est, beta1_persistent_est, hodge_L_q0_lambda2, "
-				"persistent_q1_lambda1, mtopdiv_train_val; all monitored layers; plateau min/max; "
-				"patience in patiences; start_epoch and min_delta as in settings. "
-				"Single-signal rules and 3-signal ensembles (C(5,3) metrics x 2^3 modes x ALL|ANY). "
-				"Ensemble oracle picks per-signal layer on this run (min gap vs benchmark optimum)."
-			),
 			"signal_metrics": list(signal_metrics),
 			"patience_values": sorted(set(int(x) for x in patiences)),
 			"start_epoch": int(start_epoch),
@@ -562,7 +555,6 @@ def sweep_run_directory(
 				"ranked_entries_exported": min(200, int(total_rules)),
 			},
 		},
-		"eval_note": "best=row with smallest gap_rel_pct on this run; ranks sorted by gap then stop epoch.",
 		"settings": {"start_epoch": int(start_epoch), "min_delta": float(min_delta), "patiences": sorted(set(int(x) for x in patiences))},
 		"ranked_by_gap_rel_pct": ranked_export,
 		"ensemble3_oracle_rows": ensemble_oracle_rows,
@@ -715,12 +707,8 @@ def main() -> None:
 	ap.add_argument("--full_grid", action="store_true", help="Also store exhaustive grid_rows (large).")
 	ap.add_argument("--out_suffix", type=str, default="repr_early_stop_sweep.json")
 	ap.add_argument("--skip_existing", action="store_true", help="Skip if output JSON exists and is non-empty.")
-	ap.add_argument("--json_pretty", action="store_true", help="Write indented JSON instead of one compact line.")
-	ap.add_argument(
-		"--single_only",
-		action="store_true",
-		help="Skip 3-signal ensemble rules; only evaluate single-signal rules (faster, smaller output).",
-	)
+	ap.add_argument("--json_pretty", action="store_true", help="Ignored (output is always compact JSON).")
+	ap.add_argument("--single_only", action="store_true", help="Skip 3-signal ensemble rules; only evaluate single-signal rules (faster, smaller output).")
 	args = ap.parse_args()
 
 	patiences = [int(x.strip()) for x in str(args.patience).split(",") if x.strip().isdigit()]
@@ -774,10 +762,7 @@ def main() -> None:
 			continue
 		os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
 		with open(out_json, "w", encoding="utf-8") as wf:
-			if bool(args.json_pretty):
-				json.dump(obj, wf, indent=2, ensure_ascii=False)
-			else:
-				json.dump(obj, wf, separators=(",", ":"), ensure_ascii=False)
+			json.dump(obj, wf, separators=(",", ":"), ensure_ascii=False)
 			wf.write("\n")
 		print("[ok]", rd, "->", os.path.basename(out_json), "gap_rel(best)=", obj.get("best", {}).get("gap_rel_pct") if isinstance(obj.get("best"), dict) else None)
 

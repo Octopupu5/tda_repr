@@ -18,8 +18,8 @@ Run folders referenced by the case-study pipeline:
 
 - exp_20260419_160324_cv_imagenette_resnet18_ft-full
 - exp_20260418_211916_nlp_smol-summarize_smollm2-135m_ft-full
-- exp_20260406_013322_cv_bloodmnist_convnext_tiny_ft-full
 - exp_20260505_033618_cv_bloodmnist_efficientnet_b0_ft-full
 - exp_20260408_114511_nlp_trec6_distilbert_ft-full
 - exp_20260403_042415_nlp_trec6_distilbert_ft-full
 - exp_20260404_182533_cv_imagenette_efficientnet_b0_ft-full
+- exp_20260505_194724_cv_bloodmnist_convnext_tiny_ft-full
