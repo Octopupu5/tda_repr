@@ -2,6 +2,7 @@ import os
 import time
 
 import torch
+from transformers import AutoModelForSequenceClassification, DistilBertConfig, DistilBertForSequenceClassification
 
 from tda_repr import (
 	BenchmarkSpec,
@@ -13,21 +14,6 @@ from tda_repr import (
 	get_dataset,
 	make_dataloaders,
 )
-
-
-def _maybe_login_hf() -> None:
-	# Optional login for gated datasets/models. If token file is missing, proceed unauthenticated.
-	try:
-		from huggingface_hub import login
-
-		token_path = os.path.expanduser("~/.hf_token")
-		if os.path.exists(token_path):
-			with open(token_path, "r", encoding="utf-8") as f:
-				token = f.read().strip()
-			if token:
-				login(token)
-	except Exception:
-		pass
 
 
 def _pick_layer_names(model) -> list[str]:
@@ -50,8 +36,6 @@ def _pick_layer_names(model) -> list[str]:
 
 
 def main() -> None:
-	_maybe_login_hf()
-
 	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 	dataset_key = "sst2"
 	print(f"[Setup] device={device}, dataset={dataset_key}")
@@ -66,15 +50,9 @@ def main() -> None:
 
 	print("[Setup] building model...")
 	try:
-		from transformers import AutoModelForSequenceClassification
-
-		model = AutoModelForSequenceClassification.from_pretrained(
-			"distilbert-base-uncased",
-			num_labels=2,
-		)
-	except Exception:
-		from transformers import DistilBertConfig, DistilBertForSequenceClassification
-
+		model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+	except OSError as e:
+		print(f"[Warn] Failed to load pretrained DistilBERT weights ({e}). Falling back to random init.")
 		model = DistilBertForSequenceClassification(DistilBertConfig(num_labels=2))
 
 	model.to(device)

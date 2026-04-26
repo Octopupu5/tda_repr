@@ -222,6 +222,19 @@ Outputs:
 - `top_pairs.csv`
 - `top_pairs.png`
 
+### Paper/report tables (one-shot)
+
+Build all paper-style tables from existing `runs/*` artifacts (no training rerun):
+
+```bash
+python tools/paper.py tables
+```
+
+This writes LaTeX row snippets and paper tables into:
+
+- `paper/analysis_tables/` (depth dynamics, arch comparison, runs index)
+- `paper/analysis_tables_ftb/` (paper tables: correlation summary, layer selection, early stopping)
+
 ### Checkpoints and best epoch
 
 When `--save_models` is enabled (default), each run also stores:

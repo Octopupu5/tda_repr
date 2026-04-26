@@ -8,6 +8,7 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 import time
+import gudhi
 
 from tda_repr.models import LayerTaps
 from tda_repr.mtd import mtopdiv
@@ -29,7 +30,8 @@ class RepresentationMonitorConfig:
 
 	# downsample before heavy computations
 	max_points_for_graph: int = 256
-	max_points_for_mtopdiv: int = 600
+	# MTopDiv uses a reserved pool (see paper protocol).
+	max_points_for_mtopdiv: int = 768
 	# number of smallest eigenvalues to request (ARPACK may not converge for large k)
 	max_eigs: int = 12
 
@@ -59,7 +61,11 @@ class RepresentationMonitorConfig:
 	compute_q1_spectra: bool = False
 
 	# MTopDiv params
-	mtopdiv_runs: int = 3
+	# Inner Monte Carlo averaging inside MTopDiv itself.
+	mtopdiv_runs: int = 5
+	# Outer averaging over independent 512-point subsets sampled from the reserved pool.
+	mtopdiv_subset_size: int = 512
+	mtopdiv_outer_runs: int = 10
 	mtopdiv_pdist_device: str = "cpu"  # 'cpu' or 'cuda:0' etc
 	# which stages to compare for MTopDiv
 	mtopdiv_stage_a: str = "train"
@@ -328,8 +334,6 @@ def _gudhi_rips_summaries(X: np.ndarray, max_dim: int, max_edge_length: float) -
 	"""
 	Compute Vietoris–Rips persistence via GUDHI and return scalar summaries per homology dimension.
 	"""
-	import gudhi
-
 	X = np.asarray(X, dtype=np.float64)
 	rc = gudhi.RipsComplex(points=X, max_edge_length=float(max_edge_length))
 	st = rc.create_simplex_tree(max_dimension=int(max_dim) + 1)
@@ -680,7 +684,6 @@ class RepresentationMonitor:
 						# Extra stable features from intervals (no extra deps beyond GUDHI itself)
 						grid_n = max(16, int(self.cfg.gudhi_grid_n))
 						grid = np.linspace(0.0, float(self.cfg.gudhi_max_edge_length), grid_n, dtype=np.float64)
-						import gudhi
 						rc = gudhi.RipsComplex(points=np.asarray(Xgh, dtype=np.float64), max_edge_length=float(self.cfg.gudhi_max_edge_length))
 						st = rc.create_simplex_tree(max_dimension=int(self.cfg.gudhi_max_dim) + 1)
 						st.compute_persistence()
@@ -838,16 +841,44 @@ class RepresentationMonitor:
 
 					try:
 						t0 = time.perf_counter()
-						score = mtopdiv(
-							P,
-							Q,
-							batch_size1=min(400, P.shape[0]),
-							batch_size2=min(400, Q.shape[0]),
-							n=self.cfg.mtopdiv_runs,
-							pdist_device=self.cfg.mtopdiv_pdist_device,
-							is_plot=False,
-							random_state=epoch,
-						)
+						outer = int(getattr(self.cfg, "mtopdiv_outer_runs", 1) or 1)
+						outer = max(1, outer)
+						sub_n = int(getattr(self.cfg, "mtopdiv_subset_size", 0) or 0)
+						sub_n = max(0, sub_n)
+						inner = int(getattr(self.cfg, "mtopdiv_runs", 1) or 1)
+						inner = max(1, inner)
+
+						layer_out["mtopdiv_subset_n"] = int(min(sub_n, int(P.shape[0]), int(Q.shape[0]))) if sub_n > 0 else int(min(int(P.shape[0]), int(Q.shape[0])))
+						layer_out["mtopdiv_outer_runs"] = int(outer)
+						layer_out["mtopdiv_inner_runs"] = int(inner)
+
+						seed_base = (int(epoch) & 0xFFFFFFFF) ^ (hash(str(layer)) & 0xFFFFFFFF) ^ 0x9E3779B9
+						rng = np.random.default_rng(int(seed_base))
+
+						scores: List[float] = []
+						for i in range(int(outer)):
+							n_i = int(layer_out["mtopdiv_subset_n"])
+							if n_i > 0 and (int(P.shape[0]) > n_i or int(Q.shape[0]) > n_i):
+								pi = rng.choice(int(P.shape[0]), size=n_i, replace=False)
+								qi = rng.choice(int(Q.shape[0]), size=n_i, replace=False)
+								Pi = P[pi]
+								Qi = Q[qi]
+							else:
+								Pi = P
+								Qi = Q
+							s = mtopdiv(
+								Pi,
+								Qi,
+								batch_size1=min(400, Pi.shape[0]),
+								batch_size2=min(400, Qi.shape[0]),
+								n=int(inner),
+								pdist_device=self.cfg.mtopdiv_pdist_device,
+								is_plot=False,
+								random_state=int(rng.integers(0, 2**32 - 1, dtype=np.uint32)),
+							)
+							scores.append(float(s))
+
+						score = float(np.mean(np.asarray(scores, dtype=np.float64))) if scores else 0.0
 						layer_time["mtopdiv"] = time.perf_counter() - t0
 						layer_out["mtopdiv_train_val"] = float(score)
 					except Exception as e:

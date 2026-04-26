@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import transformers
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from tqdm import tqdm
@@ -27,8 +28,9 @@ try:
 	os.makedirs(_MPLCFG, exist_ok=True)
 	os.environ.setdefault("MPLCONFIGDIR", _MPLCFG)
 except Exception:
-	# If we cannot set it here, matplotlib will handle its own fallback.
-	pass
+	print(f"[Warn] Failed to set MPLCONFIGDIR='{_MPLCFG}'. Matplotlib will use its default cache.", file=sys.stderr)
+
+import matplotlib.pyplot as plt
 
 from tda_repr.data import get_dataset, make_dataloaders
 from tda_repr.models import (
@@ -40,8 +42,10 @@ from tda_repr.models import (
 	select_names,
 	set_trainable_by_name_selection,
 )
+from tda_repr.training.benchmarks import evaluate_classification
 from tda_repr.training import BenchmarkSpec, ExperimentTracker, RepresentationMonitor, RepresentationMonitorConfig, RunStore, TrackerConfig
 from tda_repr.viz.runlog import get_series, list_scalar_series_keys, load_epoch_end_records
+from tools.correlation_report import generate_correlation_report
 
 
 def _cleanup_memory(*, device: str = "") -> None:
@@ -127,21 +131,6 @@ def _nlp_tokenizer_name(model_kind: str) -> str:
 	if k in ("smollm2-135m", "smollm2", "smollm", "smollm-135m"):
 		return "HuggingFaceTB/SmolLM2-135M"
 	return "distilbert-base-uncased"
-
-
-def _require_transformers_runexp() -> object:
-	"""
-	Lazily import `transformers` for NLP experiments.
-	Kept local to avoid making CV-only runs depend on optional NLP deps.
-	"""
-	try:
-		import transformers  # type: ignore
-	except ModuleNotFoundError as e:
-		raise ModuleNotFoundError(
-			"Optional dependency `transformers` is required for task='nlp'. "
-			"Install it with `pip install transformers` (or `pip install .[nlp]`)."
-		) from e
-	return transformers
 
 
 def _pick_transformer_blocks_generic_for_model(model: nn.Module) -> List[str]:
@@ -642,13 +631,37 @@ def _is_topo_spectral_metric(metric_name: str) -> bool:
 	return any(m.startswith(p) for p in prefixes)
 
 
-def _get_repr_layer_scalar(out: Dict[str, Any], layer: str, metric: str) -> Optional[float]:
+def _first_positive_scalar(vals: Any, zero_tol: float) -> Optional[float]:
+	if not isinstance(vals, (list, tuple)):
+		return None
+	best: Optional[float] = None
+	for x in vals:
+		if not isinstance(x, (int, float)):
+			continue
+		fx = float(x)
+		if not np.isfinite(fx):
+			continue
+		if fx > float(zero_tol):
+			best = fx if best is None else min(float(best), fx)
+	return float(best) if best is not None else None
+
+
+def _get_repr_layer_scalar(out: Dict[str, Any], layer: str, metric: str, *, zero_tol: float) -> Optional[float]:
 	try:
-		v = (((out.get("repr", {}) or {}).get("layers", {}) or {}).get(layer, {}) or {}).get(metric, None)
+		layer_obj = (((out.get("repr", {}) or {}).get("layers", {}) or {}).get(layer, {}) or {})
 	except Exception:
 		return None
+	if not isinstance(layer_obj, dict):
+		return None
+	m = str(metric).strip()
+	v = layer_obj.get(m, None)
 	if isinstance(v, (int, float)):
 		return float(v)
+	# Derived scalar metrics from stored spectra (lists).
+	if m == "hodge_L_q0_lambda2":
+		return _first_positive_scalar(layer_obj.get("hodge_L_q0_smallest", None), zero_tol=float(zero_tol))
+	if m == "persistent_q1_lambda1":
+		return _first_positive_scalar(layer_obj.get("persistent_q1_smallest", None), zero_tol=float(zero_tol))
 	return None
 
 
@@ -739,8 +752,6 @@ def _rewrite_progress_figures(
 	Rewrite simple training-progress figures after each epoch so users can open one file
 	and always see the latest full history.
 	"""
-	import matplotlib.pyplot as plt
-
 	metrics_path = os.path.join(run_dir, "metrics.jsonl")
 	if not os.path.exists(metrics_path):
 		return
@@ -1361,12 +1372,11 @@ def _build_cv_model(
 
 
 def _build_text_model(kind: str, num_classes: int, device: torch.device, pretrained: bool):
-	tf = _require_transformers_runexp()
-	AutoModel = getattr(tf, "AutoModel")
-	AutoConfig = getattr(tf, "AutoConfig")
-	AutoModelForSequenceClassification = getattr(tf, "AutoModelForSequenceClassification")
-	DistilBertConfig = getattr(tf, "DistilBertConfig")
-	DistilBertForSequenceClassification = getattr(tf, "DistilBertForSequenceClassification")
+	AutoModel = transformers.AutoModel
+	AutoConfig = transformers.AutoConfig
+	AutoModelForSequenceClassification = transformers.AutoModelForSequenceClassification
+	DistilBertConfig = transformers.DistilBertConfig
+	DistilBertForSequenceClassification = transformers.DistilBertForSequenceClassification
 
 	k = kind.lower()
 	if k in ("distilbert", "distilbert-base-uncased"):
@@ -1752,9 +1762,7 @@ def main():
 
 		nlp_tokenizer = None
 		if str(args.task).lower().strip() == "nlp" and nlp_objective == "generation":
-			tf = _require_transformers_runexp()
-			AutoTokenizer = getattr(tf, "AutoTokenizer")
-			nlp_tokenizer = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+			nlp_tokenizer = transformers.AutoTokenizer.from_pretrained(tok_name, use_fast=True)
 			# Ensure padding token exists (Llama-like tokenizers often lack it).
 			if getattr(nlp_tokenizer, "pad_token", None) is None:
 				eos = getattr(nlp_tokenizer, "eos_token", None)
@@ -2142,8 +2150,6 @@ def main():
 					prompts.append(prompt)
 					targets.append(a)
 
-				import torch
-
 				# We intentionally avoid tokenizer.pad(...) here to suppress the fast-tokenizer warning
 				# and use the tokenizer __call__ API with padding=True.
 				eos = str(getattr(nlp_tokenizer, "eos_token", "") or "")
@@ -2234,9 +2240,8 @@ def main():
 			loss_fn = nn.CrossEntropyLoss()
 		elif args.task == "nlp":
 			if nlp_objective == "generation":
-				tf = _require_transformers_runexp()
-				AutoConfig = getattr(tf, "AutoConfig")
-				AutoModelForCausalLM = getattr(tf, "AutoModelForCausalLM")
+				AutoConfig = transformers.AutoConfig
+				AutoModelForCausalLM = transformers.AutoModelForCausalLM
 				model_id = _nlp_tokenizer_name(str(args.model))
 				if bool(args.pretrained):
 					model = AutoModelForCausalLM.from_pretrained(model_id)
@@ -2372,7 +2377,16 @@ def main():
 			)
 			args.early_stop = enable_es
 			if enable_es:
-				common_metrics = ["beta0_L_est", "beta1_L_est", "beta0_persistent_est", "beta1_persistent_est", "mtopdiv_train_val", "__custom__"]
+				common_metrics = [
+					"beta0_L_est",
+					"beta1_L_est",
+					"beta0_persistent_est",
+					"beta1_persistent_est",
+					"hodge_L_q0_lambda2",
+					"persistent_q1_lambda1",
+					"mtopdiv_train_val",
+					"__custom__",
+				]
 				existing_signals = _parse_early_stop_signals(str(args.early_stop_signals), default_mode=str(args.early_stop_mode))
 				use_multi = bool(
 					inquirer.confirm(
@@ -2983,7 +2997,12 @@ def main():
 			if bool(args.early_stop) and epoch >= int(args.early_stop_start_epoch):
 				missing = []
 				for st in early_states:
-					cur = _get_repr_layer_scalar(out, layer=str(st["layer"]), metric=str(st["metric"]))
+					cur = _get_repr_layer_scalar(
+						out,
+						layer=str(st["layer"]),
+						metric=str(st["metric"]),
+						zero_tol=float(getattr(monitor_cfg, "zero_tol", 1e-8) or 1e-8),
+					)
 					if cur is None:
 						missing.append(str(st["key"]))
 						continue
@@ -3077,8 +3096,6 @@ def main():
 
 			# Extra eval on noisy val (CV)
 			if noisy_val_loader is not None:
-				from tda_repr.training.benchmarks import evaluate_classification
-
 				m = evaluate_classification(model, noisy_val_loader, loss_fn=loss_fn, max_batches=(args.max_val_batches or None))
 				store.log("noisy_val", {"epoch": epoch, "sigma": float(args.cv_noise_sigma), "metrics": m})
 
@@ -3188,8 +3205,6 @@ def main():
 			print("[TokenLengthStats]", stats)
 
 		# Auto correlation report (replaces lightweight auto-correlation summary).
-		from tools.correlation_report import generate_correlation_report
-
 		corr_report = generate_correlation_report(
 			run_dir=store.run_dir,
 			out_dir=os.path.join(store.run_dir, "correlations_report"),

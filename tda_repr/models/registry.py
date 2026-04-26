@@ -4,24 +4,7 @@ from typing import Callable, List, Optional
 import torch
 import torch.nn as nn
 import torchvision.models as tvm
-
-def _require_transformers() -> tuple[object, object, object, object]:
-	"""
-	Import HuggingFace Transformers lazily.
-
-	CI for this repository does not install `transformers` by default, and most
-	CV experiments/tests do not need it. We only require it when constructing
-	transformer-based model entries.
-	"""
-	try:
-		from transformers import AutoConfig, AutoModel, DistilBertConfig, DistilBertModel  # type: ignore
-	except ModuleNotFoundError as e:
-		raise ModuleNotFoundError(
-			"Optional dependency `transformers` is required for transformer models "
-			"(e.g. kind='distilbert' or 'smollm'). Install it with `pip install transformers`."
-		) from e
-	return AutoConfig, AutoModel, DistilBertConfig, DistilBertModel
-
+from transformers import AutoConfig, AutoModel, DistilBertConfig, DistilBertModel
 
 PreprocessFn = Callable[[torch.Tensor], torch.Tensor]
 
@@ -243,7 +226,6 @@ def get_model_info(kind: str, device: Optional[torch.device] = None, pretrained:
 		return ModelInfo(name="efficientnet_b0", family="cnn", model=model, preprocess=_cv_preprocess_224, layer_names=layer_names)
 
 	if kind in ("distilbert", "distilbert-base-uncased"):
-		AutoConfig, AutoModel, DistilBertConfig, DistilBertModel = _require_transformers()
 		cfg = DistilBertConfig()
 		model = DistilBertModel(cfg)
 		model.to(device)
@@ -251,7 +233,6 @@ def get_model_info(kind: str, device: Optional[torch.device] = None, pretrained:
 		return ModelInfo(name="distilbert-base-uncased", family="transformer", model=model, preprocess=None, layer_names=layer_names)
 
 	if kind in ("smollm", "smollm2", "smollm-135m"):
-		AutoConfig, AutoModel, DistilBertConfig, DistilBertModel = _require_transformers()
 		# Default to a local model to avoid network I/O unless pretrained was explicitly requested.
 		if pretrained:
 			try:

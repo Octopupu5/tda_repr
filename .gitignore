@@ -14,6 +14,25 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
+# OS / editor cruft
+.DS_Store
+
+# Local caches (created by scripts)
+.cache/
+.cache_*/
+.hf_cache/
+.medmnist/
+.mplconfig/
+.mplconfig_*/
+.mplconfig_render/
+.cache_render/
+
+# Virtual envs
+.venv/
+.venv_*/
+.venv_plot/
+
 # Tmp data
 data/
 runs/
+paper

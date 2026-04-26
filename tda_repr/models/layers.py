@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatch
+import re
 from typing import Iterable, List, Sequence
 
 import torch.nn as nn
@@ -45,8 +46,6 @@ def _match_any(name: str, patterns: Sequence[str], use_regex: bool) -> bool:
 	if not patterns:
 		return True
 	if use_regex:
-		import re
-
 		for pat in patterns:
 			if re.search(pat, name):
 				return True

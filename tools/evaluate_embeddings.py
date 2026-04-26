@@ -36,7 +36,7 @@ from tools.run_experiment import (
 	_repr_from_activation,
 )
 
-_ILLUSTRATION_VERSION = 2
+_ILLUSTRATION_VERSION = 3
 
 
 def _load_meta(run_dir: str) -> Dict[str, Any]:
@@ -98,6 +98,37 @@ def _auto_device_string() -> str:
 	except Exception:
 		pass
 	return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _resolve_device(preferred: str) -> str:
+	"""
+	Resolve device string safely on heterogeneous machines.
+	- If user explicitly passes --device, torch will validate it via torch.device().
+	- If device comes from meta.json and is invalid (e.g., 'cuda:0' on macOS), fall back to mps/cpu.
+	"""
+	dev = str(preferred).strip()
+	if not dev:
+		return _auto_device_string()
+	low = dev.lower()
+	if low.startswith("cuda"):
+		if hasattr(torch, "cuda") and callable(getattr(torch.cuda, "is_available", None)) and torch.cuda.is_available():
+			return dev
+		try:
+			if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+				return "mps"
+		except Exception:
+			pass
+		return "cpu"
+	if low == "mps":
+		try:
+			if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+				return "mps"
+		except Exception:
+			pass
+		raise ValueError("Requested device 'mps', but torch.backends.mps.is_available() is False on this machine.")
+	if low == "cpu":
+		return "cpu"
+	return dev
 
 
 def _first_tensor(x: Any) -> Optional[torch.Tensor]:
@@ -596,13 +627,12 @@ def _make_layer_illustration_text(
 ) -> None:
 	"""
 	Render a compact, readable layout:
-	- Anchor text (yellow) spans full width at the top.
+	- Anchor text (yellow) spans full width at the top and is centered.
 	- Up to 20 neighbors below in 2 columns (green same class, red different class).
 	"""
-	# Use readable colors on white background.
 	col_anchor = "#C9A227"  # golden/yellow
-	col_ok = "#228B22"  # forest green
-	col_bad = "#B22222"  # firebrick
+	col_ok = "#228B22"      # forest green
+	col_bad = "#B22222"     # firebrick
 
 	def _clean(s: str) -> str:
 		s = str(s).replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -617,17 +647,17 @@ def _make_layer_illustration_text(
 	neighbor_ids = [int(i) for i in neighbor_indices[:20]]
 	nn = len(neighbor_ids)
 
-	# Figure geometry: anchor row + up to 10 neighbor rows.
+	# More compact layout so anchor is visually closer to neighbors.
 	n_rows = 1 + int(np.ceil(max(1, nn) / 2.0))
-	fig_h = 1.55 + 0.72 * (n_rows - 1)
-	fig = plt.figure(figsize=(14.0, fig_h))
+	fig_h = 0.72 + 0.48 * (n_rows - 1)
+	fig = plt.figure(figsize=(11.2, fig_h))
 	gs = GridSpec(
 		nrows=n_rows,
 		ncols=2,
 		figure=fig,
-		height_ratios=[1.55] + [0.72] * (n_rows - 1),
-		wspace=0.03,  # tighter columns
-		hspace=0.22,
+		height_ratios=[0.68] + [0.48] * (n_rows - 1),
+		wspace=0.01,
+		hspace=0.03,
 	)
 
 	def _draw_cell(ax, sid: int, color: str, is_anchor: bool) -> None:
@@ -636,30 +666,46 @@ def _make_layer_illustration_text(
 		txt = _clean(_fetch_dataset_text(dataset, sid))
 		if not txt:
 			txt = "[empty]"
+
 		if is_anchor:
-			max_chars = 520
-			wrap_w = 96
-			fs = 9.6
-		else:
-			max_chars = 190
-			wrap_w = 58
+			max_chars = 420
+			wrap_w = 95
 			fs = 8.6
+		else:
+			max_chars = 150
+			wrap_w = 54
+			fs = 7.6
+
 		if len(txt) > max_chars:
 			txt = txt[: max_chars - 1] + "…"
+
 		prefix = f"id={sid} y={lab} — "
 		wrap = textwrap.TextWrapper(width=wrap_w, break_long_words=False, break_on_hyphens=False)
 		wrapped = wrap.fill(prefix + txt)
+
+		if is_anchor:
+			x_pos, y_pos = 0.5, 0.45
+			ha, va = "center", "center"
+		else:
+			x_pos, y_pos = 0.01, 0.98
+			ha, va = "left", "top"
+
 		ax.text(
-			0.01,
-			0.98,
+			x_pos,
+			y_pos,
 			wrapped,
-			va="top",
-			ha="left",
+			va=va,
+			ha=ha,
 			transform=ax.transAxes,
 			fontsize=fs,
 			color=color,
 			wrap=True,
-			bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="#DDDDDD", linewidth=0.8),
+			bbox=dict(
+				boxstyle="round,pad=0.12",
+				facecolor="white",
+				edgecolor="#DDDDDD",
+				linewidth=0.7,
+			),
 		)
 
 	# Anchor spans both columns.
@@ -679,8 +725,8 @@ def _make_layer_illustration_text(
 			color = col_ok if lab == int(anchor_class) else col_bad
 			_draw_cell(ax, sid, color, is_anchor=False)
 
-	fig.suptitle("Anchor (yellow) and nearest neighbors (green/red)", fontsize=10.5)
-	fig.tight_layout(rect=(0, 0, 1, 0.965))
+	fig.suptitle("Anchor (yellow) and nearest neighbors (green/red)", fontsize=9.5)
+	fig.tight_layout(pad=0.08, rect=(0, 0, 1, 0.96))
 	fig.savefig(out_path)
 	plt.close(fig)
 
@@ -727,6 +773,160 @@ def _make_layer_illustration(
 	plt.close(fig)
 
 
+def _make_neighbor_pair_illustrations(
+	out_dir: str,
+	file_prefix: str,
+	dataset: Any,
+	labels: torch.Tensor,
+	anchor_idx: int,
+	anchor_class: int,
+	neighbor_indices: List[int],
+	top_k_pairs: int,
+) -> List[str]:
+	"""
+	Save one PNG per neighbor: (anchor, neighbor_i) side-by-side.
+	Returns list of written file paths.
+	"""
+	os.makedirs(out_dir, exist_ok=True)
+	k = int(min(int(top_k_pairs), len(neighbor_indices)))
+	written: List[str] = []
+	for i in range(k):
+		nid = int(neighbor_indices[i])
+		nlab = int(labels[int(nid)].item())
+		ok = (int(nlab) == int(anchor_class))
+
+		xa = _fetch_dataset_image(dataset, int(anchor_idx))
+		xn = _fetch_dataset_image(dataset, int(nid))
+		ima = _to_hwc_image(xa)
+		imn = _to_hwc_image(xn)
+
+		fig = plt.figure(figsize=(6.0, 3.2), dpi=200)
+		ax1 = fig.add_subplot(1, 2, 1)
+		ax2 = fig.add_subplot(1, 2, 2)
+		ax1.imshow(ima)
+		ax2.imshow(imn)
+		for ax in (ax1, ax2):
+			ax.set_xticks([])
+			ax.set_yticks([])
+		ax1.set_title(f"Anchor (id={int(anchor_idx)})", fontsize=10)
+		ax2.set_title(f"#{i+1} (id={int(nid)})", fontsize=10)
+		col = "green" if ok else "red"
+		for ax in (ax1, ax2):
+			for spine in ax.spines.values():
+				spine.set_visible(True)
+				spine.set_linewidth(3.0)
+				spine.set_edgecolor(col)
+		fig.suptitle(
+			f"anchor y={int(anchor_class)} vs neighbor y={int(nlab)} ({'match' if ok else 'mismatch'})",
+			fontsize=10,
+			y=0.98,
+		)
+		fig.tight_layout(rect=(0, 0, 1, 0.92))
+
+		out_path = os.path.join(out_dir, f"{file_prefix}__pair_{i+1:02d}.png")
+		fig.savefig(out_path)
+		plt.close(fig)
+		written.append(out_path)
+	return written
+
+
+def _make_two_layer_topk_comparison(
+	out_path: str,
+	dataset: Any,
+	labels: torch.Tensor,
+	*,
+	anchor_idx: int,
+	anchor_class: int,
+	layer_a: str,
+	neighbors_a: List[int],
+	layer_b: str,
+	neighbors_b: List[int],
+	top_k: int,
+) -> None:
+	"""
+	Render one figure that shows the same anchor with top-k neighbors for two layers.
+	Layout: two blocks (A then B), each a 2x6 grid (12 cells) with 11 used (anchor + k neighbors).
+	"""
+	# 2x6 grid: fits anchor + 11 neighbors perfectly.
+	k = int(max(1, min(int(top_k), 11)))
+	na = [int(x) for x in neighbors_a[:k]]
+	nb = [int(x) for x in neighbors_b[:k]]
+
+	fig = plt.figure(figsize=(12.0, 8.2), dpi=220)
+
+	# Reserve a spacer row between blocks so the second label is never clipped.
+	# CHANGED: Reduced image row heights from 1.0 to 0.9 to create more vertical space for labels.
+	gs = GridSpec(
+		nrows=5,
+		ncols=6,
+		figure=fig,
+		height_ratios=[0.9, 0.9, 0.30, 0.9, 0.9],
+		# Slightly larger vertical spacing so rows are not visually glued.
+		hspace=0.10,
+		wspace=0.03,
+	)
+
+	def _draw_block(row0: int, layer_name: str, neigh: List[int]) -> List[plt.Axes]:
+		all_ids = [int(anchor_idx)] + [int(i) for i in neigh]
+		axes: List[plt.Axes] = []
+		for pos in range(12):
+			r = row0 + (pos // 6)
+			c = pos % 6
+			ax = fig.add_subplot(gs[r, c])
+			axes.append(ax)
+			ax.set_xticks([])
+			ax.set_yticks([])
+			if pos >= len(all_ids):
+				ax.axis("off")
+				continue
+			sid = int(all_ids[pos])
+			img = _fetch_dataset_image(dataset, sid)
+			arr = _to_hwc_image(img)
+			if arr.ndim == 2:
+				ax.imshow(arr, cmap="gray")
+			else:
+				ax.imshow(arr)
+			if pos == 0:
+				col = "yellow"
+				lw = 3.0
+			else:
+				lab = int(labels[sid].item())
+				col = "green" if lab == int(anchor_class) else "red"
+				lw = 2.5
+			# No per-tile titles (ids / classes / indices) to keep the figure clean.
+			for spine in ax.spines.values():
+				spine.set_edgecolor(col)
+				spine.set_linewidth(lw)
+		return axes
+
+	axes_a = _draw_block(0, str(layer_a), na)
+	axes_b = _draw_block(3, str(layer_b), nb)
+
+	def _place_label(layer_name: str, axes: List[plt.Axes], is_top: bool = False) -> None:
+		bb = axes[0].get_position(fig)
+		# Верхнюю надпись поднимаем сильнее, нижнюю — чуть-чуть.
+		y = float(bb.y1) + (0.08 if is_top else 0.020)
+		fig.text(
+			0.5,
+			y,
+			f"Layer: {layer_name}",
+			ha="center",
+			va="bottom",
+			fontsize=13,
+			weight="bold",
+		)
+
+	_place_label(str(layer_a), axes_a, is_top=True)
+	_place_label(str(layer_b), axes_b, is_top=False)
+
+
+	# Avoid tight_layout squeezing rows too much; keep GridSpec spacing.
+	fig.subplots_adjust(left=0.02, right=0.98, bottom=0.03, top=0.93)
+
+	fig.savefig(out_path)
+	plt.close(fig)
+
+
 def main() -> None:
 	ap = argparse.ArgumentParser()
 	ap.add_argument("--run_dir", type=str, required=True, help="Run directory with meta.json and checkpoints/")
@@ -757,10 +957,34 @@ def main() -> None:
 	ap.add_argument("--top_k", type=int, default=20)
 	ap.add_argument("--anchors_per_class", type=int, default=1, help="Number of random anchors per class for averaging.")
 	ap.add_argument("--seed", type=int, default=0)
+	ap.add_argument(
+		"--illustration_anchor_class",
+		type=int,
+		default=-1,
+		help="If set >=0, force the class label used for the illustration anchor across all layers (CV: 0..C-1).",
+	)
+	ap.add_argument(
+		"--illustration_anchor_index",
+		type=int,
+		default=-1,
+		help="If set >=0, force the dataset index used for the illustration anchor across all layers.",
+	)
 	ap.add_argument("--batch_size", type=int, default=0, help="0 means use training batch size from meta.")
 	ap.add_argument("--max_batches", type=int, default=0, help="If >0, limit embedding collection to this many batches.")
 	ap.add_argument("--max_samples", type=int, default=0, help="If >0, limit embedding collection to this many samples.")
 	ap.add_argument("--device", type=str, default="", help="Override device, for example mps, cuda:0 or cpu.")
+	ap.add_argument(
+		"--neighbor_pairs_top_k",
+		type=int,
+		default=0,
+		help="If >0, save one 'anchor vs neighbor' PNG per top-k neighbor (per layer).",
+	)
+	ap.add_argument(
+		"--compare_two_layers_top_k",
+		type=int,
+		default=0,
+		help="If >0 and exactly 2 layers are requested, also save one PNG that shows top-k neighbors for both layers.",
+	)
 	ap.add_argument("--download", action="store_true", help="Allow dataset download if missing locally.")
 	ap.add_argument(
 		"--build_pretrained",
@@ -810,10 +1034,9 @@ def main() -> None:
 	if not dataset or not model_name:
 		raise ValueError("Could not infer dataset/model from checkpoint payload or run meta.")
 
-	device_name = str(args.device).strip() or str(meta_args.get("device", ""))
-	if not device_name:
-		device_name = _auto_device_string()
-	device = torch.device(device_name)
+	raw_device = str(args.device).strip() if str(args.device).strip() else str(meta_args.get("device", "")).strip()
+	device_name = _resolve_device(raw_device)
+	device = torch.device(str(device_name))
 
 	batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(meta_args.get("batch_size", 64))
 	data_root = str(meta_args.get("data_root", "./data"))
@@ -873,6 +1096,8 @@ def main() -> None:
 	layers = [x for x in req_layers if x in all_modules]
 	if not layers:
 		raise ValueError("No valid embedding layers were provided/found in the model.")
+	if int(args.compare_two_layers_top_k) > 0 and len(layers) != 2:
+		raise ValueError("--compare_two_layers_top_k requires exactly 2 layers (use --layers \"layerA,layerB\").")
 
 	signal_layers = _read_signal_layers(run_dir)
 
@@ -880,8 +1105,8 @@ def main() -> None:
 	os.makedirs(analysis_dir, exist_ok=True)
 	tag = os.path.splitext(os.path.basename(ckpt_path))[0]
 	layer_reports: List[Dict[str, Any]] = []
-	anchor_class_for_illustration: Optional[int] = None
-	anchor_idx_for_illustration: Optional[int] = None
+	anchor_class_for_illustration: Optional[int] = int(args.illustration_anchor_class) if int(args.illustration_anchor_class) >= 0 else None
+	anchor_idx_for_illustration: Optional[int] = int(args.illustration_anchor_index) if int(args.illustration_anchor_index) >= 0 else None
 	valid_layers: List[str] = []
 	reused_count = 0
 
@@ -973,13 +1198,37 @@ def main() -> None:
 			seed=int(args.seed),
 			anchors_per_class=int(args.anchors_per_class),
 		)
-		if anchors_by_class and (anchor_class_for_illustration is None or anchor_idx_for_illustration is None):
+		# Only auto-pick when neither is forced by args.
+		if anchors_by_class and (anchor_class_for_illustration is None and anchor_idx_for_illustration is None):
 			rng = np.random.default_rng(int(args.seed))
 			class_choices = sorted(list(anchors_by_class.keys()))
 			anchor_class_for_illustration = int(rng.choice(class_choices))
 			anchor_idx_for_illustration = int(rng.choice(anchors_by_class[anchor_class_for_illustration]))
 	else:
 		anchors_by_class = {}
+
+	# If the user forces anchor index, infer/validate its class once (before per-layer loop),
+	# so we don't silently write per-layer error rows.
+	if anchor_idx_for_illustration is not None:
+		if labels_np is None:
+			raise RuntimeError("Could not infer labels to validate --illustration_anchor_index.")
+		n_lab = int(labels_np.shape[0])
+		if not (0 <= int(anchor_idx_for_illustration) < n_lab):
+			raise ValueError(f"--illustration_anchor_index={anchor_idx_for_illustration} out of range (n={n_lab}).")
+		inferred_cls = int(labels_np[int(anchor_idx_for_illustration)])
+		if anchor_class_for_illustration is None:
+			anchor_class_for_illustration = inferred_cls
+		elif int(anchor_class_for_illustration) != int(inferred_cls):
+			raise ValueError(
+				f"Illustration anchor label mismatch: index={anchor_idx_for_illustration} has label={inferred_cls}, "
+				f"but --illustration_anchor_class={anchor_class_for_illustration}. "
+				"Did you swap class and index?"
+			)
+		if task == "cv" and int(num_classes) > 0 and int(anchor_class_for_illustration) >= int(num_classes):
+			raise ValueError(
+				f"--illustration_anchor_class={anchor_class_for_illustration} is out of range for num_classes={num_classes}. "
+				"Did you swap class and index?"
+			)
 
 	for layer in layers_to_compute:
 		try:
@@ -1016,6 +1265,18 @@ def main() -> None:
 			macro_ratio_std = float(np.std(class_means)) if class_means else 0.0
 
 			layer_json, layer_png = layer_paths[layer]
+			if anchor_idx_for_illustration is None or anchor_class_for_illustration is None:
+				raise RuntimeError("Internal error: illustration anchor was not selected.")
+			if not (0 <= int(anchor_idx_for_illustration) < int(labels.shape[0])):
+				raise ValueError(
+					f"Illustration anchor index out of range: {anchor_idx_for_illustration} (n={int(labels.shape[0])})"
+				)
+			lbl = int(labels[int(anchor_idx_for_illustration)].item())
+			if lbl != int(anchor_class_for_illustration):
+				raise ValueError(
+					f"Illustration anchor label mismatch: idx={anchor_idx_for_illustration} has label={lbl}, "
+					f"but --illustration_anchor_class={anchor_class_for_illustration}."
+				)
 			illustr = _score_anchor(
 				emb=emb,
 				labels=labels,
@@ -1033,6 +1294,19 @@ def main() -> None:
 					anchor_class=int(anchor_class_for_illustration),
 					neighbor_indices=list(illustr["neighbor_indices"]),
 				)
+				if int(args.neighbor_pairs_top_k) > 0:
+					_safe_layer = _safe_name(str(layer))
+					prefix = f"embedding_retrieval_{tag}__layer_{_safe_layer}"
+					_make_neighbor_pair_illustrations(
+						out_dir=analysis_dir,
+						file_prefix=prefix,
+						dataset=loader.dataset,
+						labels=labels,
+						anchor_idx=int(anchor_idx_for_illustration),
+						anchor_class=int(anchor_class_for_illustration),
+						neighbor_indices=list(illustr["neighbor_indices"]),
+						top_k_pairs=int(args.neighbor_pairs_top_k),
+					)
 				illustr_path = layer_png
 			elif task == "nlp":
 				_make_layer_illustration_text(
@@ -1104,6 +1378,65 @@ def main() -> None:
 	out_path = os.path.join(analysis_dir, f"embedding_retrieval_{tag}__summary.json")
 	with open(out_path, "w", encoding="utf-8") as f:
 		json.dump(summary, f, ensure_ascii=False, indent=2)
+
+	# Optional: single PNG comparing top-k neighbors for two layers.
+	if task == "cv" and int(args.compare_two_layers_top_k) > 0:
+		# Prefer a "good" row that has illustration info; don't accidentally pick an error row.
+		by_layer: Dict[str, Dict[str, Any]] = {}
+		last_err: Dict[str, str] = {}
+		for rr in layer_reports:
+			if not isinstance(rr, dict):
+				continue
+			ln = str(rr.get("layer", "") or "")
+			if not ln:
+				continue
+			if "error" in rr and isinstance(rr.get("error", None), str):
+				last_err[ln] = str(rr.get("error", "") or "")
+				continue
+			if isinstance(rr.get("illustration_anchor", None), dict):
+				by_layer[ln] = rr
+		la = str(layers[0])
+		lb = str(layers[1])
+		ra = by_layer.get(la, None)
+		rb = by_layer.get(lb, None)
+		if not (isinstance(ra, dict) and isinstance(rb, dict)):
+			ea = last_err.get(la, "")
+			eb = last_err.get(lb, "")
+			raise RuntimeError(
+				"Could not find both layer reports for comparison rendering. "
+				f"layer_a={la!r} error={ea!r}; layer_b={lb!r} error={eb!r}. "
+				"Tip: ensure --illustration_anchor_index/--illustration_anchor_class are correct and rerun with --no-skip_existing."
+			)
+		ia = ra.get("illustration_anchor", None)
+		ib = rb.get("illustration_anchor", None)
+		if not (isinstance(ia, dict) and isinstance(ib, dict)):
+			raise RuntimeError(
+				"Missing illustration_anchor in one of the layer reports. "
+				"Tip: rerun with --no-skip_existing and a valid illustration anchor."
+			)
+		na = ia.get("neighbor_indices", None)
+		nb = ib.get("neighbor_indices", None)
+		if not (isinstance(na, list) and isinstance(nb, list)):
+			raise RuntimeError("Missing neighbor_indices in one of the layer reports.")
+		out_cmp = os.path.join(
+			analysis_dir,
+			f"embedding_retrieval_{tag}__compare_{_safe_name(la)}_vs_{_safe_name(lb)}.png",
+		)
+		if anchor_idx_for_illustration is None or anchor_class_for_illustration is None:
+			raise RuntimeError("Internal error: illustration anchor not set.")
+		_make_two_layer_topk_comparison(
+			out_path=out_cmp,
+			dataset=loader.dataset,
+			labels=labels,
+			anchor_idx=int(anchor_idx_for_illustration),
+			anchor_class=int(anchor_class_for_illustration),
+			layer_a=la,
+			neighbors_a=[int(x) for x in na],
+			layer_b=lb,
+			neighbors_b=[int(x) for x in nb],
+			top_k=int(args.compare_two_layers_top_k),
+		)
+		print("[EmbeddingEval] saved comparison:", out_cmp)
 
 	print(f"[EmbeddingEval] saved summary: {out_path}")
 	for r in summary_ok[:5]:
