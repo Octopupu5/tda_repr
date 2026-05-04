@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tda-repr"
+version = "0.1.4"
+description = "Topological and spectral analysis of neural representations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = [
+  "topological data analysis",
+  "representation learning",
+  "deep learning",
+  "computer vision",
+  "natural language processing",
+  "persistent homology",
+  "hodge laplacian",
+  "neural network monitoring",
+]
+authors = [
+  { name = "Stepan Pankratov" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "matplotlib",
+  "Pillow",
+  "torch",
+  "torchvision",
+  "transformers",
+  "datasets",
+  "tokenizers",
+  "medmnist",
+  "ripser",
+  "gudhi",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build", "twine", "ruff>=0.6.0", "pre-commit>=3.8.0"]
+
+[project.urls]
+Repository = "https://github.com/Octopupu5/tda_repr"
+
+[project.scripts]
+tda-repr-layers = "tda_repr.cli.layers:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["tda_repr*"]
+
+[tool.pytest.ini_options]
+python_files = ["*.py"]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9"]
