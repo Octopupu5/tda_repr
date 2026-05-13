@@ -21,7 +21,7 @@ run_one () {
     --task "$task" \
     --dataset "$dataset" \
     --model "$model" \
-    --device cpu \
+    --device "${DEVICE:-cpu}" \
     --finetune full \
     --epochs "$epochs" \
     --batch_size 128 \
@@ -37,18 +37,18 @@ run_selection_seed () {
   seed="$1"
 
   rd="$(run_one "runs/reproduction_select" cv mnist mlp "$seed" 20)"
-  python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split val --device cpu --download --skip_existing
+  python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split val --device "${DEVICE:-cpu}" --download --skip_existing
 
   for model in resnet18 efficientnet_b0 convnext_tiny; do
     for ds in cifar10 bloodmnist imagenette; do
       rd="$(run_one "runs/reproduction_select" cv "$ds" "$model" "$seed" 20)"
-      python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split val --device cpu --download --skip_existing
+      python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split val --device "${DEVICE:-cpu}" --download --skip_existing
     done
   done
 
   for ds in sst2 trec6; do
     rd="$(run_one "runs/reproduction_select" nlp "$ds" distilbert "$seed" 20)"
-    python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split test --device cpu --download --skip_existing
+    python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split test --device "${DEVICE:-cpu}" --download --skip_existing
   done
 }
 
