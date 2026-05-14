@@ -13,6 +13,8 @@ run_one () {
   model="$4"
   seed="$5"
   epochs="$6"
+  shift 6
+  extra_args=("$@")
 
   runs_base="${root}/exp"
   python -m tools.run_experiment \
@@ -22,13 +24,16 @@ run_one () {
     --dataset "$dataset" \
     --model "$model" \
     --device "${DEVICE:-cpu}" \
+    --pretrained \
     --finetune full \
     --epochs "$epochs" \
-    --batch_size 128 \
+    --batch_size 16 \
     --download \
     --compute_mtopdiv \
     --compute_q1_spectra \
-    --seed "$seed"
+    --seed "$seed" \
+    "${extra_args[@]}" \
+    1>&2
 
   ls -1dt "${runs_base}"_* | head -n 1
 }
@@ -50,22 +55,34 @@ run_selection_seed () {
     rd="$(run_one "runs/reproduction_select" nlp "$ds" distilbert "$seed" 20)"
     python -m tools.evaluate_embeddings --run_dir "$rd" --checkpoint best_main --split test --device "${DEVICE:-cpu}" --download --skip_existing
   done
+
+  run_one "runs/reproduction_select" nlp smol-summarize smollm2-135m "$seed" 20 \
+    --nlp_max_train_examples 50000 \
+    --nlp_max_val_examples 10000 \
+    --nlp_max_test_examples 10000 \
+    >/dev/null 2>&1
 }
 
 run_eval_seed () {
   seed="$1"
 
-  run_one "runs/reproduction_eval" cv mnist mlp "$seed" 20 >/dev/null
+  run_one "runs/reproduction_eval" cv mnist mlp "$seed" 20 >/dev/null 2>&1
 
   for model in resnet18 efficientnet_b0 convnext_tiny; do
     for ds in cifar10 bloodmnist imagenette; do
-      run_one "runs/reproduction_eval" cv "$ds" "$model" "$seed" 20 >/dev/null
+      run_one "runs/reproduction_eval" cv "$ds" "$model" "$seed" 20 >/dev/null 2>&1
     done
   done
 
   for ds in sst2 trec6; do
-    run_one "runs/reproduction_eval" nlp "$ds" distilbert "$seed" 20 >/dev/null
+    run_one "runs/reproduction_eval" nlp "$ds" distilbert "$seed" 20 >/dev/null 2>&1
   done
+
+  run_one "runs/reproduction_eval" nlp smol-summarize smollm2-135m "$seed" 20 \
+    --nlp_max_train_examples 50000 \
+    --nlp_max_val_examples 10000 \
+    --nlp_max_test_examples 10000 \
+    >/dev/null 2>&1
 }
 
 for seed in 0 1 2; do
